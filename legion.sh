@@ -69,6 +69,66 @@ info() { _say "$C_INFO" "$I_INFO" "$*" info; }
 warn() { _say "$C_WARN" "$I_WARN" "$*" warn; }
 section() { printf '\n%s%s%s\n' "$C_BOLD" "$*" "$C_RST" >&3; }
 
+# Ubuntu logo (Circle of Friends on an orange disc), 26 x 26 pixels:
+# . empty, o orange, w white. Two pixel rows make one line of half blocks.
+LOGO_PX=(
+  .........oooooooo.........
+  .......oooooooooooo.......
+  .....oooooooooooooooo.....
+  ....oooooooooooowwwooo....
+  ...oooooooooooowwwwwooo...
+  ..ooooooooooooowwwwwoooo..
+  ..oooooooooooooowwwwoooo..
+  .ooooooooowwwwooooooooooo.
+  .oooooooowwwwwooooooooooo.
+  oooooooowwwwwwooowoooooooo
+  ooooooowwwwooooowwwooooooo
+  oowwwwooowoooooowwwooooooo
+  oowwwwoooooooooowwwooooooo
+  oowwwwoooooooooowwwooooooo
+  oowwwwooowoooooowwwooooooo
+  ooooooowwwwooooowwwooooooo
+  oooooooowwwwwwooowoooooooo
+  .oooooooowwwwwooooooooooo.
+  .ooooooooowwwwooooooooooo.
+  ..oooooooooooooowwwwoooo..
+  ..ooooooooooooowwwwwoooo..
+  ...oooooooooooowwwwwooo...
+  ....oooooooooooowwwooo....
+  .....oooooooooooooooo.....
+  .......oooooooooooo.......
+  .........oooooooo.........
+)
+
+# Turns LOGO_PX into 13 coloured lines of half-block characters in LOGO_LINES.
+logo_lines() {
+  local fo fw bo bw r c t b top bot line z=$'\e[0m'
+  if [[ "${COLORTERM:-}" == *truecolor* || "${COLORTERM:-}" == *24bit* ]]; then
+    fo=$'\e[38;2;233;84;32m' fw=$'\e[38;2;255;255;255m' bo=$'\e[48;2;233;84;32m' bw=$'\e[48;2;255;255;255m'
+  else
+    fo=$'\e[38;5;202m' fw=$'\e[38;5;231m' bo=$'\e[48;5;202m' bw=$'\e[48;5;231m'
+  fi
+  LOGO_LINES=()
+  for ((r = 0; r < ${#LOGO_PX[@]}; r += 2)); do
+    top="${LOGO_PX[r]}" bot="${LOGO_PX[r + 1]}" line=""
+    for ((c = 0; c < ${#top}; c++)); do
+      t="${top:c:1}" b="${bot:c:1}"
+      case "$t$b" in
+        ..) line+=" " ;;
+        .o) line+="$fo▄$z" ;;
+        .w) line+="$fw▄$z" ;;
+        o.) line+="$fo▀$z" ;;
+        w.) line+="$fw▀$z" ;;
+        oo) line+="$fo█$z" ;;
+        ww) line+="$fw█$z" ;;
+        ow) line+="$fo$bw▀$z" ;;
+        wo) line+="$fw$bo▀$z" ;;
+      esac
+    done
+    LOGO_LINES+=("$line")
+  done
+}
+
 banner() {
   local lines i grad=(51 45 39 33 27 21)
   if [ "$UTF8" = 1 ]; then
@@ -84,11 +144,30 @@ banner() {
     lines=("L E G I O N")
   fi
   echo >&3
-  for i in "${!lines[@]}"; do
-    if [ -n "$C_RST" ]; then printf '  \e[38;5;%sm%s\e[0m\n' "${grad[i]}" "${lines[i]}" >&3
-    else printf '  %s\n' "${lines[i]}" >&3; fi
-    [ "$ANIM" = 0 ] || sleep 0.07
-  done
+  # The Ubuntu logo sits left of the lettering when there is colour, UTF-8 and
+  # room (80 columns); otherwise the lettering is shown alone.
+  local cols logo=0 n
+  cols="$({ stty size </dev/tty; } 2>/dev/null | awk '{ print $2 }')"
+  [ "${cols:-0}" -gt 0 ] 2>/dev/null || cols="$(tput cols 2>/dev/null)"
+  [ "${cols:-0}" -gt 0 ] 2>/dev/null || cols="${COLUMNS:-80}"
+  if [ "$UTF8" = 1 ] && [ -n "$C_RST" ] && [ "${cols:-0}" -ge 80 ]; then logo=1; logo_lines; fi
+  if [ "$logo" = 1 ]; then
+    for i in "${!LOGO_LINES[@]}"; do
+      n=$((i - 3)) # centres the 6 letter rows on the 13 logo rows
+      if [ "$n" -ge 0 ] && [ "$n" -lt "${#lines[@]}" ]; then
+        printf '  %s   \e[38;5;%sm%s\e[0m\n' "${LOGO_LINES[i]}" "${grad[n]}" "${lines[n]}" >&3
+      else
+        printf '  %s\n' "${LOGO_LINES[i]}" >&3
+      fi
+      [ "$ANIM" = 0 ] || sleep 0.04
+    done
+  else
+    for i in "${!lines[@]}"; do
+      if [ -n "$C_RST" ]; then printf '  \e[38;5;%sm%s\e[0m\n' "${grad[i]}" "${lines[i]}" >&3
+      else printf '  %s\n' "${lines[i]}" >&3; fi
+      [ "$ANIM" = 0 ] || sleep 0.07
+    done
+  fi
   printf '  %sP R O F I L E   ·   endpoint hardening   ·   SOC 2 evidence%s\n\n' "$C_DIM" "$C_RST" >&3
   if [ "$ANIM" = 1 ]; then
     local w=40 p full empty fill="#" rest="."
