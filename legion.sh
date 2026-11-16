@@ -639,7 +639,10 @@ step_integrity() {
   # Ubuntu's own daily AIDE job, which scans the whole system, is turned off so
   # nothing is scanned twice. auditd still records who changed key files.
   apt-get "${APT[@]}" install aide
+  # Stop it before masking; masking a running timer leaves it "failed".
+  systemctl disable --now dailyaidecheck.timer >/dev/null 2>&1 || true
   systemctl mask dailyaidecheck.timer >/dev/null 2>&1 || true
+  systemctl reset-failed dailyaidecheck.timer >/dev/null 2>&1 || true
   install -d -m 700 "$STATE/aide"
   install -d -m 755 /etc/legion
   cat >/etc/legion/aide.conf <<'EOF'

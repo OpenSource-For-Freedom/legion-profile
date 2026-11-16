@@ -88,7 +88,9 @@ unit_off() { # stops, disables and deletes a unit Legion created
 section "Scheduled scans and checks"
 undo "YARA weekly scan removed" bash -c "$(declare -f unit_off); unit_off legion-yara-scan.timer legion-yara-scan.service; rm -f /usr/local/sbin/legion-yara-update /usr/local/sbin/legion-yara-scan"
 undo "integrity check removed (AIDE and package checks)" bash -c "$(declare -f unit_off); unit_off legion-integrity.timer legion-integrity.service; rm -f /usr/local/sbin/legion-aide-baseline /usr/local/sbin/legion-integrity-check /etc/apt/apt.conf.d/99legion-aide; rm -rf /etc/legion"
-undo "Ubuntu's own daily AIDE timer unmasked" bash -c 'systemctl unmask dailyaidecheck.timer 2>/dev/null || true'
+undo "Ubuntu's own daily AIDE timer restored" bash -c '
+  systemctl unmask dailyaidecheck.timer 2>/dev/null || true
+  if dpkg -s aide >/dev/null 2>&1; then systemctl enable --now dailyaidecheck.timer 2>/dev/null || true; fi'
 undo "ClamAV weekly scan removed" bash -c "$(declare -f unit_off); unit_off clamscan-home.timer clamscan-home.service"
 undo "Legion state removed (/var/lib/legion)" rm -rf /var/lib/legion
 systemctl daemon-reload
