@@ -1,6 +1,8 @@
 # Legion Profile
 
-A single script that hardens an Ubuntu laptop or desktop and writes an evidence report you can hand to a SOC 2 auditor. It goes past SOC 2 with YARA malware scanning and file integrity monitoring.
+A single script that hardens an Ubuntu 26.04 laptop or desktop and proves it. Every check is mapped to SOC 2, HIPAA, NIST 800-53 (FedRAMP) and NIST 800-171 (CMMC Level 2) controls, and each run produces a report and a checksummed evidence bundle you can hand to an auditor.
+
+There is no official CIS or DISA STIG benchmark for Ubuntu 26.04 yet. Legion applies the CIS Ubuntu 24.04 rules that fit 26.04, and runs the official benchmark automatically once it is published.
 
 ![Legion running on Ubuntu 26.04](docs/legion-run.png)
 
@@ -9,23 +11,21 @@ A single script that hardens an Ubuntu laptop or desktop and writes an evidence 
 - **Ubuntu Pro**: security updates for every package (ESM) and Livepatch. Optional, needs your free token from https://ubuntu.com/pro/dashboard
 - **Updates**: installs all pending updates and turns on daily automatic security updates
 - **Firewall**: blocks incoming connections, allows outgoing
+- **Account lockout**: 5 failed logins lock an account for 30 minutes, then it unlocks by itself
+- **Login banner** and a **screen lock** after 10 minutes that users cannot turn off
+- **Password policy**: new passwords need 12+ characters and 3 character types
 - **Audit logging**: records changes to accounts, sudo, system time, kernel modules and the firewall
 - **Log retention**: keeps system logs for 1 year
 - **Malware scanning**: ClamAV weekly, plus YARA weekly with the YARA Forge core rules
 - **File integrity**: daily check of installed package files and of /etc, /boot, /usr/local and /root
-- **Password policy**: new passwords need 12+ characters and 3 character types
 - **System hardening**: safer kernel settings, unused network protocols blocked, tighter cron and sudoers permissions
-- **Evidence report**: `/var/log/legion/endpoint-report.txt`
-
-It does not set up disk encryption, backups, device management (MDM) or central logging. SOC 2 also covers policies and processes that no script can.
+- **Daily compliance check**: flags any check that starts failing
 
 ## Before you run it
 
 **Encrypt the disk when you install Ubuntu.** Encryption can only be turned on during installation (Advanced features, then Use LVM and encryption). It cannot be added later without wiping the disk.
 
 ## How to run it
-
-Works on Ubuntu 24.04 and 26.04.
 
 ```bash
 git clone https://github.com/OpenSource-For-Freedom/legion-profile.git
@@ -41,7 +41,25 @@ To skip the token question:
 UBUNTU_PRO_SECRET=your-token bash legion.sh
 ```
 
+After the first run, check the device any time without changing anything:
+
+```bash
+sudo legion --check
+```
+
 Run `bash legion.sh --help` for all options. It is safe to run again.
+
+## Reports and evidence
+
+- Compliance report: `/var/log/legion/compliance-report.md` (and `.json`)
+- Evidence bundles: `/var/log/legion/evidence/`, each with a SHA-256 checksum
+- Scan results: `/var/log/legion/yara-scan.log` and `integrity.log`
+
+A ClamAV, YARA, integrity or daily compliance finding marks its service as failed. Check with `systemctl --failed`.
+
+## If you get locked out
+
+Wait 30 minutes, or have another admin run `sudo faillock --user NAME --reset`.
 
 ## How to remove it
 
@@ -52,3 +70,9 @@ bash legion-remove.sh
 ```
 
 It keeps installed updates, Ubuntu Pro and your logs. Add `--remove-packages`, `--detach-pro` or `--purge-logs` to remove those too. Reboot afterwards.
+
+## Good to know
+
+- No script makes an organisation compliant. These frameworks also cover policies, training, backups and vendor agreements; the report lists what Legion cannot check.
+- FIPS-validated cryptography, required for FedRAMP and CMMC, is not yet available for Ubuntu 26.04. Legion reports it and picks it up once Ubuntu Pro offers it.
+- Docker bypasses the firewall for published container ports.

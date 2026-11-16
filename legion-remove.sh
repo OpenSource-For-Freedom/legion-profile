@@ -6,7 +6,7 @@
 #   bash legion-remove.sh [options]       (asks for your sudo password)
 #
 # Options:
-#   --remove-packages  also uninstall auditd, ClamAV, YARA and AIDE
+#   --remove-packages  also uninstall auditd, ClamAV, YARA, AIDE and OpenSCAP
 #   --detach-pro       also detach this machine from Ubuntu Pro
 #   --purge-logs       also delete /var/log/legion (your evidence reports)
 #   -y, --yes          don't ask for confirmation
@@ -58,7 +58,7 @@ fi
 
 section "Legion Profile removal"
 info "this undoes Legion's settings and puts Ubuntu's defaults back"
-[ "$REMOVE_PACKAGES" = 0 ] || warn "also uninstalling auditd, ClamAV, YARA and AIDE"
+[ "$REMOVE_PACKAGES" = 0 ] || warn "also uninstalling auditd, ClamAV, YARA, AIDE and OpenSCAP"
 [ "$DETACH_PRO" = 0 ] || warn "also detaching from Ubuntu Pro"
 [ "$PURGE_LOGS" = 0 ] || warn "also deleting /var/log/legion, including your evidence reports"
 if [ "$YES" = 0 ]; then
@@ -85,6 +85,33 @@ unit_off() { # stops, disables and deletes a unit Legion created
   done
 }
 
+section "Login settings"
+B=/var/lib/legion/backup
+if [ -f /usr/share/pam-configs/legion-faillock ] || [ -f /usr/share/pam-configs/legion-faillock-notify ]; then
+  undo "account lockout removed" bash -c '
+    pam-auth-update --disable legion-faillock legion-faillock-notify &&
+      rm -f /usr/share/pam-configs/legion-faillock /usr/share/pam-configs/legion-faillock-notify &&
+      sed -i -E "/^legion-faillock(-notify)?$/d" /var/lib/pam/seen &&
+      ! grep -q pam_faillock /etc/pam.d/common-auth'
+fi
+if [ -d "$B" ]; then
+  # shellcheck disable=SC2016 # expanded by the inner shell
+  undo "login banner restored" bash -c '
+    for f in issue issue.net; do
+      if [ -f "$1/$f" ]; then cp -p "$1/$f" "/etc/$f"; elif [ -f "$1/$f.absent" ]; then rm -f "/etc/$f"; fi
+    done' _ "$B"
+fi
+if [ -f /etc/dconf/db/gdm.d/01-legion-banner ] || [ -f /etc/dconf/db/local.d/00-legion-screenlock ]; then
+  # Empty settings folders are left in place on purpose: dconf update then
+  # rebuilds them as empty databases, so no Legion lock survives.
+  # shellcheck disable=SC2016 # expanded by the inner shell
+  undo "login screen banner and enforced screen lock removed" bash -c '
+    rm -f /etc/dconf/db/gdm.d/01-legion-banner /etc/dconf/db/local.d/00-legion-screenlock /etc/dconf/db/local.d/locks/00-legion-screenlock
+    [ ! -f "$1/created-dconf-profile-gdm" ] || rm -f /etc/dconf/profile/gdm
+    [ ! -f "$1/created-dconf-profile-user" ] || rm -f /etc/dconf/profile/user
+    dconf update' _ "$B"
+fi
+
 section "Scheduled scans and checks"
 undo "YARA weekly scan removed" bash -c "$(declare -f unit_off); unit_off legion-yara-scan.timer legion-yara-scan.service; rm -f /usr/local/sbin/legion-yara-update /usr/local/sbin/legion-yara-scan"
 undo "integrity check removed (AIDE and package checks)" bash -c "$(declare -f unit_off); unit_off legion-integrity.timer legion-integrity.service; rm -f /usr/local/sbin/legion-aide-baseline /usr/local/sbin/legion-integrity-check /etc/apt/apt.conf.d/99legion-aide; rm -rf /etc/legion"
@@ -92,6 +119,7 @@ undo "Ubuntu's own daily AIDE timer restored" bash -c '
   systemctl unmask dailyaidecheck.timer 2>/dev/null || true
   if dpkg -s aide >/dev/null 2>&1; then systemctl enable --now dailyaidecheck.timer 2>/dev/null || true; fi'
 undo "ClamAV weekly scan removed" bash -c "$(declare -f unit_off); unit_off clamscan-home.timer clamscan-home.service"
+undo "daily compliance check and the legion command removed" bash -c "$(declare -f unit_off); unit_off legion-check.timer legion-check.service; rm -f /usr/local/sbin/legion"
 undo "Legion state removed (/var/lib/legion)" rm -rf /var/lib/legion
 systemctl daemon-reload
 
@@ -135,7 +163,7 @@ if [ "$REMOVE_PACKAGES" = 1 ]; then
   section "Packages"
   export DEBIAN_FRONTEND=noninteractive
   pkgs=()
-  for p in auditd audispd-plugins clamav clamav-freshclam yara aide aide-common; do
+  for p in auditd audispd-plugins clamav clamav-freshclam yara aide aide-common openscap-scanner ssg-debderived; do
     dpkg -s "$p" >/dev/null 2>&1 && pkgs+=("$p")
   done
   if [ "${#pkgs[@]}" -gt 0 ]; then

@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Legion Profile: endpoint hardening for Ubuntu laptops and desktops.
+# Legion Profile: endpoint hardening and compliance evidence for Ubuntu 26.04
+# laptops and desktops.
 #
-# Hardens the device, adds YARA malware scanning and file integrity
-# monitoring, and writes an evidence report for the endpoint controls SOC 2
-# auditors ask about. It does not make anyone "SOC 2 compliant": SOC 2 audits
-# an organisation, and this covers one device.
+# Hardens the device, adds YARA malware scanning, file integrity monitoring
+# and account lockout, and writes a compliance report that maps every check to
+# SOC 2, HIPAA, NIST 800-53 (FedRAMP) and NIST 800-171 (CMMC Level 2) controls.
+# No script makes an organisation compliant: these frameworks also cover
+# policies, people and processes. Legion covers one device and proves it.
 #
 # SET UP DISK ENCRYPTION FIRST. Full-disk encryption can only be chosen when
 # Ubuntu is installed (installer: "Advanced features" > "Use LVM and
@@ -24,8 +26,15 @@
 #   --with-tools         also install lynis, gitleaks, pre-commit, shellcheck,
 #                        python3-venv, python3-pip, deja-dup, Bitwarden,
 #                        Terraform and Trivy
-#   --report-only        change nothing; only write the evidence report
+#   --no-lockout         skip the account lockout (5 failed logins lock an
+#                        account for 30 minutes, then it unlocks by itself)
+#   --check              change nothing; check the device against the profile,
+#                        write the reports, exit 1 if any check fails
+#   --report-only        like --check, but always exit 0
 #   -h, --help           show this help
+#
+# After the first run Legion installs itself as `legion`, so later checks are
+# just: sudo legion --check
 #
 # Set UBUNTU_PRO_SECRET to your Ubuntu Pro token to skip the token question.
 # Set NO_COLOR=1 for plain output, LEGION_NO_ANIM=1 to skip the animation.
@@ -98,7 +107,7 @@ banner() {
 
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; }
 
-ALLOW_UNENCRYPTED=0 STEAM=0 TOOLS=0 YARA=1 AIDE=1 PRO=1 REPORT_ONLY=0 BANNER_SHOWN=0
+ALLOW_UNENCRYPTED=0 STEAM=0 TOOLS=0 YARA=1 AIDE=1 PRO=1 LOCKOUT=1 REPORT_ONLY=0 CHECK=0 DRIFT_ONLY=0 BANNER_SHOWN=0
 PRO_TOKEN_FILE=""
 ARGS=()
 while [ $# -gt 0 ]; do
@@ -113,6 +122,9 @@ while [ $# -gt 0 ]; do
       [ $# -ge 2 ] && [ -f "$2" ] || { echo "--pro-token-file needs a path to a file" >&2; exit 2; }
       PRO_TOKEN_FILE="$(readlink -f "$2")"
       ARGS+=("$1" "$PRO_TOKEN_FILE"); shift 2; continue ;;
+    --no-lockout) LOCKOUT=0 ;;
+    --check) CHECK=1 ;;
+    --drift-only) CHECK=1; DRIFT_ONLY=1 ;; # internal: daily timer; exit 1 only on new failures
     --report-only) REPORT_ONLY=1 ;;
     --banner-shown) BANNER_SHOWN=1; shift; continue ;; # internal: set when re-run through sudo
     -h | --help) usage; exit 0 ;;
@@ -122,7 +134,10 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-[ "$BANNER_SHOWN" = 1 ] || banner
+READONLY=0
+[ "$CHECK" = 0 ] && [ "$REPORT_ONLY" = 0 ] || READONLY=1
+LEGION_VERSION="2026.11"
+[ "$BANNER_SHOWN" = 1 ] || [ "$DRIFT_ONLY" = 1 ] || banner
 
 if [ "$(id -u)" != 0 ]; then
   SELF="$(readlink -f "$0" 2>/dev/null || true)"
@@ -142,7 +157,6 @@ export NEEDRESTART_MODE=l # needrestart: list services to restart, don't restart
 APT=(-y -q -o DPkg::Lock::Timeout=300 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
 LOGDIR=/var/log/legion
 STATE=/var/lib/legion
-REPORT="$LOGDIR/endpoint-report.txt"
 install -d -m 750 "$LOGDIR"
 install -d -m 700 "$STATE"
 RUNLOG="$LOGDIR/run-$(date +%Y%m%d-%H%M%S).log"
@@ -151,6 +165,7 @@ chmod 640 "$RUNLOG"
 FLAGS="$(mktemp -d)" # steps run in subshells and leave notes for the summary here
 trap 'rm -rf "$FLAGS"' EXIT
 
+SELF_PATH="$(readlink -f "$0")"
 osr() { sed -n "s/^$1=//p" /etc/os-release | tr -d '"'; }
 OS_ID="$(osr ID)"
 OS_VERSION="$(osr VERSION_ID)"
@@ -181,8 +196,8 @@ if [ "$OS_ID" != ubuntu ]; then
   fail "operating system: ${OS_ID:-unknown}. Legion supports Ubuntu only"; exit 2
 fi
 case "$OS_VERSION" in
-  24.04 | 26.04) ok "operating system: $(osr PRETTY_NAME)" ;;
-  *) warn "operating system: $(osr PRETTY_NAME) (tested on 24.04 and 26.04; continuing)" ;;
+  26.04) ok "operating system: $(osr PRETTY_NAME)" ;;
+  *) warn "operating system: $(osr PRETTY_NAME). Legion is built and tested for Ubuntu 26.04; continuing untested" ;;
 esac
 case "$ARCH" in
   x86_64 | aarch64) ok "architecture: $ARCH" ;;
@@ -190,7 +205,7 @@ case "$ARCH" in
 esac
 if [ -d /run/systemd/system ]; then ok "init system: systemd"; else fail "init system: systemd is not running"; exit 2; fi
 if [ "$IN_CONTAINER" = 1 ]; then info "running in a container: kernel settings and audit rules are written but not loaded"; fi
-if [ "$REPORT_ONLY" = 0 ]; then
+if [ "$READONLY" = 0 ]; then
   FREE_GB=$(($(df --output=avail -k / | tail -n 1) / 1024 / 1024))
   if [ "$FREE_GB" -ge 3 ]; then ok "free disk space: ${FREE_GB} GB"; else fail "free disk space: ${FREE_GB} GB (need 3 GB)"; exit 2; fi
   # curl is not installed on a fresh Ubuntu Desktop, so test with a plain TCP connection.
@@ -210,7 +225,7 @@ if root_encrypted; then
   ok "disk encryption: root filesystem is encrypted"
 else
   fail "disk encryption: root filesystem is NOT encrypted"
-  if [ "$REPORT_ONLY" = 0 ] && [ "$ALLOW_UNENCRYPTED" = 0 ]; then
+  if [ "$READONLY" = 0 ] && [ "$ALLOW_UNENCRYPTED" = 0 ]; then
     info "encryption can only be enabled by reinstalling Ubuntu with \"Use LVM and encryption\""
     if [ -t 0 ] && [ -t 1 ]; then
       printf '  %s?%s continue and record encryption as a gap? [y/N] ' "$C_WARN" "$C_RST" >&3
@@ -232,7 +247,7 @@ fi
 # read without echo, never written to the log, and never put on a command line.
 PRO_TOKEN=""
 pro_attached() { command -v pro >/dev/null && pro status --format json 2>/dev/null | grep -q '"attached": *true'; }
-if [ "$REPORT_ONLY" = 0 ] && [ "$PRO" = 1 ]; then
+if [ "$READONLY" = 0 ] && [ "$PRO" = 1 ]; then
   if pro_attached; then
     ok "Ubuntu Pro: already attached"
   elif [ -n "${UBUNTU_PRO_SECRET:-}" ]; then
@@ -298,7 +313,7 @@ add_signed_repo() {
 }
 
 STEP=0
-TOTAL=$((8 + WITH_PRO + YARA + AIDE + TOOLS))
+TOTAL=$((10 + WITH_PRO + YARA + AIDE + LOCKOUT + TOOLS))
 RESULTS=()
 FAILED=0
 
@@ -776,7 +791,137 @@ step_tools() {
   [ -z "$missing_all" ] || warn "not installed:$missing_all"
 }
 
-if [ "$REPORT_ONLY" = 0 ]; then
+step_login() {
+  # Login banner (NIST AC-8, 800-171 3.1.9) and an enforced screen lock
+  # (HIPAA automatic logoff, NIST AC-11, 800-171 3.1.10). Originals are kept in
+  # $STATE/backup so legion-remove.sh can put them back.
+  local text="Authorized use only. Activity on this device may be monitored and recorded."
+  install -d -m 700 "$STATE/backup"
+  local f
+  for f in /etc/issue /etc/issue.net; do
+    [ -e "$STATE/backup/${f##*/}" ] || [ -e "$STATE/backup/${f##*/}.absent" ] ||
+      cp -p "$f" "$STATE/backup/${f##*/}" 2>/dev/null || : >"$STATE/backup/${f##*/}.absent"
+  done
+  printf '%s\n\n' "$text" >/etc/issue
+  printf '%s\n' "$text" >/etc/issue.net
+  info "login banner set for the console and remote logins"
+  if [ ! -f /usr/share/glib-2.0/schemas/org.gnome.desktop.screensaver.gschema.xml ] || ! command -v dconf >/dev/null; then
+    info "no GNOME desktop found; login screen banner and screen lock skipped"
+    return 0
+  fi
+  install -d -m 755 /etc/dconf/profile /etc/dconf/db/local.d/locks /etc/dconf/db/gdm.d
+  # Login screen banner. GDM reads the "gdm" dconf profile; the /etc copy is
+  # Ubuntu's own profile with Legion's system database added.
+  if [ ! -f /etc/dconf/profile/gdm ] && [ -f /usr/share/dconf/profile/gdm ]; then
+    awk '{ print } /^user-db:user$/ { print "system-db:gdm" }' /usr/share/dconf/profile/gdm >/etc/dconf/profile/gdm
+    : >"$STATE/backup/created-dconf-profile-gdm"
+  fi
+  if grep -qx 'system-db:gdm' /etc/dconf/profile/gdm 2>/dev/null; then
+    cat >/etc/dconf/db/gdm.d/01-legion-banner <<EOF
+[org/gnome/login-screen]
+banner-message-enable=true
+banner-message-text='$text'
+EOF
+    info "login screen banner set"
+  else
+    warn "custom GDM settings profile found; login screen banner not set"
+  fi
+  # Screen lock after 10 minutes idle, locked immediately, and users cannot
+  # turn it off (dconf locks). 10 minutes meets CIS, DISA STIG and CMMC.
+  if [ ! -f /etc/dconf/profile/user ]; then
+    printf 'user-db:user\nsystem-db:local\n' >/etc/dconf/profile/user
+    : >"$STATE/backup/created-dconf-profile-user"
+  fi
+  if grep -qx 'system-db:local' /etc/dconf/profile/user; then
+    cat >/etc/dconf/db/local.d/00-legion-screenlock <<'EOF'
+[org/gnome/desktop/session]
+idle-delay=uint32 600
+
+[org/gnome/desktop/screensaver]
+lock-enabled=true
+lock-delay=uint32 0
+EOF
+    cat >/etc/dconf/db/local.d/locks/00-legion-screenlock <<'EOF'
+/org/gnome/desktop/session/idle-delay
+/org/gnome/desktop/screensaver/lock-enabled
+/org/gnome/desktop/screensaver/lock-delay
+EOF
+    info "screen locks after 10 minutes idle; users cannot turn this off"
+  else
+    warn "custom user settings profile found; screen lock not enforced"
+  fi
+  dconf update
+}
+
+step_lockout() {
+  # Locks an account for 30 minutes after 5 failed logins within 15 minutes,
+  # then it unlocks by itself (NIST AC-7, 800-171 3.1.8). root is not locked,
+  # so recovery stays possible. Added through pam-auth-update, Ubuntu's
+  # supported way to change login settings; never by editing PAM files.
+  local args="deny=5 fail_interval=900 unlock_time=1800 audit"
+  cat >/usr/share/pam-configs/legion-faillock <<EOF
+Name: Legion Profile: lock an account for 30 minutes after 5 failed logins
+Default: yes
+Priority: 0
+Auth-Type: Primary
+Auth:
+	[default=die]	pam_faillock.so authfail $args
+EOF
+  cat >/usr/share/pam-configs/legion-faillock-notify <<EOF
+Name: Legion Profile: check and reset failed login counts
+Default: yes
+Priority: 1024
+Auth-Type: Primary
+Auth:
+	requisite	pam_faillock.so preauth $args
+Account-Type: Primary
+Account:
+	required	pam_faillock.so
+EOF
+  pam-auth-update --enable legion-faillock legion-faillock-notify
+  if grep -q 'pam_faillock.so preauth' /etc/pam.d/common-auth && grep -q 'pam_faillock.so authfail' /etc/pam.d/common-auth; then
+    info "5 failed logins lock an account for 30 minutes; unlock sooner with: sudo faillock --user NAME --reset"
+  else
+    # pam-auth-update leaves locally edited PAM files alone. Undo cleanly.
+    pam-auth-update --disable legion-faillock legion-faillock-notify || true
+    rm -f /usr/share/pam-configs/legion-faillock /usr/share/pam-configs/legion-faillock-notify
+    warn "the login (PAM) files have local edits, so the lockout was not added"
+    return 1
+  fi
+}
+
+step_compliance() {
+  # SCAP tooling: when CIS / DISA STIG content for this Ubuntu release is
+  # published in ssg-debderived, the compliance check runs it automatically.
+  install_available openscap-scanner ssg-debderived
+  # Install Legion itself so checks can run without the repository.
+  if [ "$SELF_PATH" != /usr/local/sbin/legion ]; then install -m 755 "$SELF_PATH" /usr/local/sbin/legion; fi
+  cat >/etc/systemd/system/legion-check.service <<'EOF'
+[Unit]
+Description=Daily Legion Profile compliance check
+[Service]
+Type=oneshot
+Nice=19
+IOSchedulingClass=idle
+Environment=NO_COLOR=1 LEGION_NO_ANIM=1
+ExecStart=/usr/local/sbin/legion --drift-only
+EOF
+  cat >/etc/systemd/system/legion-check.timer <<'EOF'
+[Unit]
+Description=Daily Legion Profile compliance check
+[Timer]
+OnCalendar=*-*-* 06:30
+RandomizedDelaySec=30m
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now legion-check.timer
+  info "installed as 'legion'; a daily check at 06:30 flags any check that starts failing"
+}
+
+if [ "$READONLY" = 0 ]; then
   section "Deploying profile"
   [ "$WITH_PRO" = 0 ] || run_step "Ubuntu Pro: ESM security updates and Livepatch" step_pro
   run_step "Patching: install all pending updates" step_patching
@@ -789,73 +934,401 @@ if [ "$REPORT_ONLY" = 0 ]; then
   run_step "System hardening: kernel, protocols, permissions" step_hardening
   [ "$YARA" = 0 ] || run_step "YARA: weekly scan of user-writable folders" step_yara
   [ "$AIDE" = 0 ] || run_step "Integrity: package checksums and AIDE, daily" step_integrity
+  run_step "Login: banner and enforced screen lock" step_login
+  [ "$LOCKOUT" = 0 ] || run_step "Account lockout: 5 failed logins, 30 minutes" step_lockout
   [ "$TOOLS" = 0 ] || run_step "Tools: audit, secrets, backups, Terraform, Trivy" step_tools
+  run_step "Compliance: daily check, SCAP content" step_compliance
 fi
 
-# ---------------------------------------------------------------- report
+# ---------------------------------------------------------------- compliance
 
-section "Evidence report"
-set +e
-{
-  echo "Legion Profile endpoint evidence, $(hostname), $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  echo; echo "-- OS"; osr PRETTY_NAME; uname -r
-  echo; echo "-- disk encryption"
-  if [ "$ENCRYPTED" = 1 ]; then echo "root filesystem encrypted: yes"; else echo "root filesystem encrypted: NO (gap: reinstall with encryption)"; fi
-  lsblk -o NAME,TYPE,FSTYPE,MOUNTPOINTS | grep -E 'crypt|/$'
-  echo; echo "-- pending updates"; apt list --upgradable 2>/dev/null | grep -c upgradable
-  echo; echo "-- reboot required"; if [ -f /var/run/reboot-required ]; then echo yes; else echo no; fi
-  echo; echo "-- auto updates"; cat /etc/apt/apt.conf.d/20auto-upgrades
-  echo; echo "-- ubuntu pro"; pro status 2>/dev/null || echo "pro client not installed"
-  echo; echo "-- firewall"; ufw status verbose
-  echo; echo "-- secure boot"; mokutil --sb-state
-  echo; echo "-- apparmor"; if aa-enabled -q 2>/dev/null; then echo enabled; else echo disabled; fi
-  echo; echo "-- auditd"; systemctl is-active auditd; echo "$(auditctl -l 2>/dev/null | grep -c .) rules loaded"
-  echo; echo "-- journald"; cat /etc/systemd/journald.conf.d/legion.conf
-  echo; echo "-- clamav"; systemctl is-active clamav-freshclam; systemctl is-enabled clamscan-home.timer
-  echo; echo "-- yara"; systemctl is-enabled legion-yara-scan.timer; cat "$STATE/yara/VERSION"
-  echo; echo "-- integrity monitoring"; systemctl is-enabled legion-integrity.timer
-  echo "AIDE baseline $(date -r "$STATE/aide/aide.db" +%F 2>/dev/null || echo missing)"
-  echo; echo "-- password policy"; cat /etc/security/pwquality.conf.d/legion.conf
-  echo; echo "-- kernel hardening"; sysctl kernel.kptr_restrict fs.suid_dumpable fs.protected_fifos net.ipv4.conf.all.send_redirects
-  echo; echo "-- time sync"; timedatectl show -p NTPSynchronized
-  echo; echo "-- user accounts (uid >= 1000)"; awk -F: '$3 >= 1000 && $3 < 65534 { print $1, "uid=" $3, $7 }' /etc/passwd
-  echo; echo "-- sudo group"; getent group sudo
-  if [ -n "${SUDO_USER:-}" ] && command -v gsettings >/dev/null; then
-    echo; echo "-- screen lock ($SUDO_USER)"
-    for k in "org.gnome.desktop.screensaver lock-enabled" "org.gnome.desktop.session idle-delay"; do
-      # shellcheck disable=SC2086 # $k is a schema and a key
-      printf '%s = %s\n' "$k" "$(sudo -u "$SUDO_USER" gsettings get $k 2>/dev/null || echo unknown)"
-    done
-  fi
-  echo; echo "-- listening (non-loopback)"; ss -tulnH | awk '$5 !~ /^(127\.|\[::1\]|127\.0\.0\.53)/ { print $1, $5 }'
-} >"$REPORT" 2>&1
-chmod 640 "$REPORT"
-
-# Live checks for the terminal summary: one line per control.
-check() { # label, command...
-  local label="$1"; shift
-  if "$@" >/dev/null 2>&1; then ok "$label"; else fail "$label"; fi
+# Each check sets NOTE and returns 0 (pass), 1 (fail) or 2 (not applicable or
+# not available). The rules follow the CIS Ubuntu 24.04 benchmark where it
+# applies to 26.04; no CIS or DISA STIG benchmark for 26.04 exists yet.
+NOTE=""
+in_container() { [ "$IN_CONTAINER" = 1 ] && { NOTE="runs on the host kernel, not checkable in a container"; return 0; }; return 1; }
+pro_service() { # prints "<available> <status>" for an Ubuntu Pro service
+  pro status --format json 2>/dev/null | python3 -I -c '
+import json, sys
+d = json.load(sys.stdin)
+for s in d.get("services", []):
+    if s.get("name") == sys.argv[1]:
+        print(s.get("available", "-"), s.get("status", "-"))
+        break' "$1" 2>/dev/null
 }
-if [ "$ENCRYPTED" = 1 ]; then ok "disk encryption"; else fail "disk encryption (reinstall needed)"; fi
-check "firewall active" bash -c 'ufw status | grep -q "Status: active"'
-check "automatic security updates" test -f /etc/apt/apt.conf.d/20auto-upgrades
-if pro_attached; then ok "Ubuntu Pro attached (ESM security updates)"; else info "Ubuntu Pro not attached"; fi
-if [ "$IN_CONTAINER" = 1 ]; then info "audit rules: not loaded inside a container"
-else check "audit logging running" systemctl is-active auditd; fi
-check "log retention configured" test -f /etc/systemd/journald.conf.d/legion.conf
-check "ClamAV weekly scan scheduled" systemctl is-enabled clamscan-home.timer
-check "password policy" test -f /etc/security/pwquality.conf.d/legion.conf
-if [ -f /etc/systemd/system/legion-yara-scan.timer ]; then
-  check "YARA weekly scan scheduled, rules ready" bash -c "systemctl is-enabled legion-yara-scan.timer && test -s $STATE/yara/rules.yarc"
-else info "YARA scan not enabled"; fi
-if [ -f /etc/systemd/system/legion-integrity.timer ]; then
-  check "integrity check scheduled, AIDE baseline ready" bash -c "systemctl is-enabled legion-integrity.timer && test -f $STATE/aide/aide.db"
-else info "integrity check not enabled"; fi
-set -e
-info "full report: $REPORT"
-info "run log: $RUNLOG"
 
-[ "$REPORT_ONLY" = 1 ] && exit 0
+c_encryption() { [ "$ENCRYPTED" = 1 ] && return 0; NOTE="reinstall Ubuntu with full-disk encryption"; return 1; }
+c_fips() {
+  [ "$(cat /proc/sys/crypto/fips_enabled 2>/dev/null)" = 1 ] && { NOTE="FIPS mode on"; return 0; }
+  local a st
+  read -r a st <<<"$(pro_service fips-updates)"
+  if [ "$st" = disabled ]; then NOTE="available: sudo pro enable fips-updates (needs a reboot)"; return 1; fi
+  if [ "$a" = yes ] && ! pro_attached; then NOTE="available after attaching Ubuntu Pro"; return 1; fi
+  NOTE="FIPS-validated packages are not yet available for Ubuntu $OS_VERSION"
+  return 2
+}
+c_updates() {
+  local n
+  n="$(apt-get -s -o Debug::NoLocking=1 upgrade 2>/dev/null | grep -c '^Inst .*-security' || true)"
+  [ "$n" = 0 ] && return 0
+  NOTE="$n security updates pending"; return 1
+}
+c_autoupdates() {
+  local UU=0
+  eval "$(apt-config shell UU APT::Periodic::Unattended-Upgrade)"
+  [ "$UU" = 1 ] && return 0; NOTE="automatic security updates are off"; return 1
+}
+c_pro() { pro_attached && return 0; NOTE="optional: attach Ubuntu Pro for security updates to every package"; return 2; }
+c_livepatch() {
+  in_container && return 2
+  local a st
+  read -r a st <<<"$(pro_service livepatch)"
+  [ "$st" = enabled ] && return 0
+  pro_attached || { NOTE="optional: needs Ubuntu Pro"; return 2; }
+  NOTE="enable with: sudo pro enable livepatch"; return 1
+}
+c_firewall() {
+  local out
+  out="$(ufw status verbose 2>/dev/null)"
+  grep -q 'Status: active' <<<"$out" && grep -q 'deny (incoming)' <<<"$out" && return 0
+  NOTE="firewall off or not blocking incoming connections"; return 1
+}
+c_auditd() { in_container && return 2; systemctl is-active -q auditd && return 0; NOTE="auditd not running"; return 1; }
+c_audit_rules() {
+  in_container && return 2
+  local r k
+  r="$(auditctl -l 2>/dev/null)"
+  for k in identity privilege time modules; do
+    grep -q "key=$k" <<<"$r" || { NOTE="audit rules for '$k' not loaded"; return 1; }
+  done
+}
+c_log_retention() {
+  grep -qx 'Storage=persistent' /etc/systemd/journald.conf.d/legion.conf 2>/dev/null &&
+    grep -qx 'MaxRetentionSec=1year' /etc/systemd/journald.conf.d/legion.conf && [ -d /var/log/journal ] && return 0
+  NOTE="system logs are not kept for a year"; return 1
+}
+c_log_protect() {
+  local d p
+  for d in /var/log/audit /var/log/legion; do
+    [ -d "$d" ] || continue
+    p="$(stat -c %a "$d")"
+    case "$p" in 700 | 750) ;; *) NOTE="$d is readable by other users ($p)"; return 1 ;; esac
+  done
+}
+c_time() {
+  in_container && return 2
+  [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = yes ] && return 0
+  NOTE="clock not synchronised"; return 1
+}
+c_clamav() {
+  systemctl is-active -q clamav-freshclam && systemctl is-enabled -q clamscan-home.timer && return 0
+  NOTE="ClamAV updates or weekly scan not running"; return 1
+}
+c_yara() {
+  systemctl is-enabled -q legion-yara-scan.timer 2>/dev/null && [ -s "$STATE/yara/rules.yarc" ] && return 0
+  NOTE="YARA scan not set up (run Legion without --no-yara)"; return 1
+}
+c_integrity() {
+  systemctl is-enabled -q legion-integrity.timer 2>/dev/null && [ -f "$STATE/aide/aide.db" ] && return 0
+  NOTE="integrity check not set up (run Legion without --no-aide)"; return 1
+}
+c_password() {
+  local conf minlen minclass
+  conf="$(cat /etc/security/pwquality.conf /etc/security/pwquality.conf.d/*.conf 2>/dev/null | grep -vE '^\s*#')"
+  minlen="$(awk -F= '/^[[:space:]]*minlen[[:space:]]*=/ { gsub(/ /, "", $2); v = $2 } END { print v + 0 }' <<<"$conf")"
+  minclass="$(awk -F= '/^[[:space:]]*minclass[[:space:]]*=/ { gsub(/ /, "", $2); v = $2 } END { print v + 0 }' <<<"$conf")"
+  [ "$minlen" -ge 12 ] && [ "$minclass" -ge 3 ] && return 0
+  NOTE="passwords need at least 12 characters and 3 character types"; return 1
+}
+c_lockout() {
+  grep -q 'pam_faillock.so preauth' /etc/pam.d/common-auth 2>/dev/null &&
+    grep -q 'pam_faillock.so authfail' /etc/pam.d/common-auth && return 0
+  NOTE="no lockout after failed logins (run Legion without --no-lockout)"; return 1
+}
+c_banner() {
+  grep -qi 'authorized use only' /etc/issue 2>/dev/null && grep -qi 'authorized use only' /etc/issue.net 2>/dev/null && return 0
+  NOTE="no login banner"; return 1
+}
+c_screenlock() {
+  [ -f /usr/share/glib-2.0/schemas/org.gnome.desktop.screensaver.gschema.xml ] || { NOTE="no GNOME desktop"; return 2; }
+  local f=/etc/dconf/db/local.d/00-legion-screenlock delay
+  if ! { [ -f "$f" ] && [ -f /etc/dconf/db/local.d/locks/00-legion-screenlock ] &&
+    grep -qx 'system-db:local' /etc/dconf/profile/user 2>/dev/null; }; then
+    NOTE="screen lock not enforced"; return 1
+  fi
+  delay="$(awk '/^idle-delay=/ { print $2 }' "$f")"
+  [ "${delay:-0}" -gt 0 ] && [ "$delay" -le 900 ] && grep -qx 'lock-enabled=true' "$f" && return 0
+  NOTE="screen lock delay is not 15 minutes or less"; return 1
+}
+c_secureboot() {
+  in_container && return 2
+  command -v mokutil >/dev/null || { NOTE="mokutil not installed"; return 2; }
+  mokutil --sb-state 2>/dev/null | grep -q 'SecureBoot enabled' && return 0
+  NOTE="Secure Boot is off (turn it on in the firmware settings)"; return 1
+}
+c_apparmor() { in_container && return 2; aa-enabled -q 2>/dev/null && return 0; NOTE="AppArmor is off"; return 1; }
+c_ssh() {
+  if ! ss -ltnH 2>/dev/null | awk '{ print $4 }' | grep -qE ':22$'; then NOTE="no SSH server listening"; return 0; fi
+  local t
+  t="$(sshd -T 2>/dev/null)"
+  grep -qx 'permitrootlogin no' <<<"$t" && grep -qx 'passwordauthentication no' <<<"$t" && return 0
+  NOTE="SSH allows root or password logins"; return 1
+}
+c_listeners() {
+  local l
+  l="$(ss -ltnH 2>/dev/null | awk '$4 !~ /^(127\.|\[::1\]|\[::ffff:127\.)/ && $4 !~ /%lo:/ { print $4 }' | sort -u | tr '\n' ' ')"
+  [ -z "$l" ] && return 0
+  NOTE="reachable TCP ports: ${l% } (ports published by Docker bypass the firewall)"; return 1
+}
+c_kernel() {
+  in_container && return 2
+  [ "$(sysctl -n kernel.kptr_restrict)" = 2 ] && [ "$(sysctl -n fs.suid_dumpable)" = 0 ] &&
+    [ "$(sysctl -n fs.protected_fifos)" = 2 ] && [ "$(sysctl -n net.ipv4.conf.all.send_redirects)" = 0 ] && return 0
+  NOTE="kernel settings differ (reboot, or run Legion again)"; return 1
+}
+c_aslr() { [ "$(sysctl -n kernel.randomize_va_space 2>/dev/null)" = 2 ] && return 0; NOTE="memory address randomisation is not full"; return 1; }
+c_protocols() {
+  grep -q 'install sctp /bin/false' /etc/modprobe.d/legion-uncommon-net.conf 2>/dev/null && return 0
+  NOTE="unused network protocols are not blocked"; return 1
+}
+c_perms() {
+  [ ! -f /etc/crontab ] || [ "$(stat -c %a /etc/crontab)" = 600 ] || { NOTE="/etc/crontab is readable by other users"; return 1; }
+  local d
+  for d in /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /etc/cron.monthly; do
+    [ ! -d "$d" ] || [ "$(stat -c %a "$d")" = 700 ] || { NOTE="$d is readable by other users"; return 1; }
+  done
+  [ ! -d /etc/sudoers.d ] || [ "$(stat -c %a /etc/sudoers.d)" = 750 ] || { NOTE="/etc/sudoers.d is readable by other users"; return 1; }
+}
+c_empty_passwords() {
+  awk -F: '$2 == "" { f = 1 } END { exit !f }' /etc/shadow && { NOTE="an account has no password"; return 1; }
+  return 0
+}
+c_uid0() {
+  [ "$(awk -F: '$3 == 0 { print $1 }' /etc/passwd | tr '\n' ' ')" = "root " ] && return 0
+  NOTE="an account other than root has full administrator rights (UID 0)"; return 1
+}
+c_scap() {
+  local ds="/usr/share/xml/scap/ssg/content/ssg-ubuntu${OS_VERSION//./}-ds.xml" profile fails
+  if [ ! -f "$ds" ] || ! command -v oscap >/dev/null; then
+    NOTE="no CIS / DISA STIG SCAP content for Ubuntu $OS_VERSION yet; runs automatically once published"; return 2
+  fi
+  profile="$(oscap info --profiles "$ds" 2>/dev/null | grep -o '^[^:]*cis_level1_workstation' | head -n 1)"
+  [ -n "$profile" ] || { NOTE="SCAP content found, but no CIS Level 1 Workstation profile"; return 2; }
+  oscap xccdf eval --profile "$profile" --report "$LOGDIR/cis-scap-report.html" "$ds" >"$LOGDIR/cis-scap.txt" 2>&1
+  fails="$(grep -c '^Result.*fail' "$LOGDIR/cis-scap.txt" || true)"
+  [ "$fails" = 0 ] && { NOTE="CIS Level 1 Workstation: all rules pass"; return 0; }
+  NOTE="$fails CIS Level 1 Workstation rules fail; see cis-scap-report.html"; return 1
+}
+
+# id | check | function | SOC 2 | HIPAA | NIST 800-53 | NIST 800-171 / CMMC L2
+CHECKS=(
+  "disk-encryption|Full-disk encryption|c_encryption|CC6.1|164.312(a)(2)(iv)|SC-28|3.13.16"
+  "fips|FIPS-validated cryptography|c_fips|CC6.1|164.312(a)(2)(iv)|SC-13|3.13.11"
+  "security-updates|No pending security updates|c_updates|CC7.1|164.308(a)(1)(ii)(B)|SI-2|3.14.1"
+  "auto-updates|Automatic security updates|c_autoupdates|CC7.1|164.308(a)(1)(ii)(B)|SI-2|3.14.1"
+  "ubuntu-pro|Ubuntu Pro (ESM security updates)|c_pro|CC7.1|164.308(a)(1)(ii)(B)|SI-2|3.14.1"
+  "livepatch|Livepatch (kernel fixes without reboot)|c_livepatch|CC7.1|-|SI-2|3.14.1"
+  "firewall|Firewall blocks incoming connections|c_firewall|CC6.6|-|SC-7|3.13.1"
+  "listeners|No reachable network services|c_listeners|CC6.6|-|CM-7|3.4.7"
+  "ssh|SSH hardened or off|c_ssh|CC6.6|164.312(a)(1)|CM-7|3.4.7"
+  "protocols|Unused network protocols blocked|c_protocols|CC6.6|-|CM-7|3.4.6"
+  "auditd|Audit logging running|c_auditd|CC7.2|164.312(b)|AU-12|3.3.1"
+  "audit-rules|Audit rules for accounts, sudo, time, modules|c_audit_rules|CC7.2|164.312(b)|AU-2|3.3.1"
+  "log-retention|System logs kept for 1 year|c_log_retention|CC7.2|164.312(b)|AU-11|3.3.1"
+  "log-protection|Audit logs readable only by admins|c_log_protect|CC7.2|164.312(b)|AU-9|3.3.8"
+  "time-sync|Clock synchronised|c_time|CC7.2|164.312(b)|AU-8|3.3.7"
+  "clamav|ClamAV updates and weekly scan|c_clamav|CC6.8|164.308(a)(5)(ii)(B)|SI-3|3.14.2"
+  "yara|YARA weekly scan|c_yara|CC6.8|164.308(a)(5)(ii)(B)|SI-3|3.14.5"
+  "integrity|Daily file integrity check|c_integrity|CC7.1|164.312(c)(1)|SI-7|-"
+  "secure-boot|Secure Boot|c_secureboot|CC6.8|-|SI-7(9)|-"
+  "apparmor|AppArmor confinement|c_apparmor|CC6.8|-|AC-3(3)|-"
+  "kernel|Kernel hardening settings|c_kernel|CC7.1|-|CM-6|3.4.2"
+  "aslr|Full memory address randomisation|c_aslr|CC6.8|-|SI-16|-"
+  "password-policy|Password length and complexity|c_password|CC6.1|164.308(a)(5)(ii)(D)|IA-5(1)|3.5.7"
+  "lockout|Lockout after failed logins|c_lockout|CC6.1|164.308(a)(5)(ii)(C)|AC-7|3.1.8"
+  "empty-passwords|No accounts without a password|c_empty_passwords|CC6.1|164.312(d)|IA-2|3.5.2"
+  "uid0|Only root has UID 0|c_uid0|CC6.1|164.312(a)(1)|AC-6|3.1.5"
+  "permissions|Cron and sudoers locked to admins|c_perms|CC6.1|164.312(a)(1)|AC-6|3.1.5"
+  "screen-lock|Enforced screen lock|c_screenlock|CC6.1|164.312(a)(2)(iii)|AC-11|3.1.10"
+  "banner|Login banner|c_banner|-|-|AC-8|3.1.9"
+  "cis-scap|CIS benchmark scan (OpenSCAP)|c_scap|CC7.1|-|CM-6|3.4.2"
+)
+# Evidence these frameworks need that no device check can provide.
+MANUAL=(
+  "Backups and tested restores|A1.2|164.308(a)(7)(ii)(A)|CP-9|3.8.9"
+  "Multi-factor authentication|CC6.1|164.312(d)|IA-2(1)|3.5.3"
+  "Central log collection and review|CC7.2|164.308(a)(1)(ii)(D)|AU-6|3.3.5"
+  "Risk assessment|CC3.2|164.308(a)(1)(ii)(A)|RA-3|3.11.1"
+  "Security awareness training|CC2.2|164.308(a)(5)(i)|AT-2|3.2.1"
+  "Incident response plan|CC7.4|164.308(a)(6)|IR-8|3.6.1"
+  "Vendor agreements (BAAs, subprocessors)|CC9.2|164.308(b)(1)|SA-9|-"
+  "Written security policies|CC5.3|164.316(a)|PL-1|-"
+)
+FRAMEWORKS=("SOC 2" "HIPAA" "NIST 800-53 (FedRAMP)" "NIST 800-171 (CMMC L2)")
+
+R_ID=() R_TITLE=() R_STATUS=() R_NOTE=() R_MAP=()
+run_checks() {
+  local line id title fn s h n5 n1 rc
+  for line in "${CHECKS[@]}"; do
+    IFS='|' read -r id title fn s h n5 n1 <<<"$line"
+    NOTE=""
+    set +e
+    "$fn" >/dev/null 2>&1
+    rc=$?
+    set -e
+    R_ID+=("$id") R_TITLE+=("$title") R_NOTE+=("$NOTE") R_MAP+=("$s|$h|$n5|$n1")
+    case "$rc" in 0) R_STATUS+=(pass) ;; 1) R_STATUS+=(fail) ;; *) R_STATUS+=(n/a) ;; esac
+  done
+}
+
+json_esc() { local v="${1//\\/\\\\}"; v="${v//\"/\\\"}"; printf '%s' "$v"; }
+
+write_reports() {
+  local md="$LOGDIR/compliance-report.md" js="$LOGDIR/compliance-report.json" now i f col p n a
+  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  {
+    echo "# Legion Profile compliance report"
+    echo
+    echo "- Device: $(hostname)"
+    echo "- System: $(osr PRETTY_NAME), kernel $(uname -r)"
+    echo "- Checked: $now"
+    echo "- Legion: $LEGION_VERSION"
+    echo
+    echo "This report is evidence for an auditor, not an audit. Checks follow the CIS Ubuntu 24.04 benchmark where it applies to 26.04; no CIS or DISA STIG benchmark for 26.04 has been published. Control IDs show where each check is used as evidence."
+    echo
+    echo "## Summary"
+    echo
+    echo "| Framework | Pass | Fail | Not available |"
+    echo "|---|---|---|---|"
+    for col in 0 1 2 3; do
+      p=0 n=0 a=0
+      for i in "${!R_ID[@]}"; do
+        IFS='|' read -r -a f <<<"${R_MAP[i]}"
+        [ "${f[col]}" != "-" ] || continue
+        case "${R_STATUS[i]}" in pass) p=$((p + 1)) ;; fail) n=$((n + 1)) ;; *) a=$((a + 1)) ;; esac
+      done
+      echo "| ${FRAMEWORKS[col]} | $p | $n | $a |"
+    done
+    echo
+    echo "## Device checks"
+    echo
+    echo "| Check | Result | SOC 2 | HIPAA | NIST 800-53 | NIST 800-171 / CMMC L2 | Notes |"
+    echo "|---|---|---|---|---|---|---|"
+    for i in "${!R_ID[@]}"; do
+      IFS='|' read -r -a f <<<"${R_MAP[i]}"
+      case "${R_STATUS[i]}" in pass) r="PASS" ;; fail) r="**FAIL**" ;; *) r="not available" ;; esac
+      echo "| ${R_TITLE[i]} | $r | ${f[0]} | ${f[1]} | ${f[2]} | ${f[3]} | ${R_NOTE[i]} |"
+    done
+    echo
+    echo "## Evidence needed from outside this device"
+    echo
+    echo "| Item | SOC 2 | HIPAA | NIST 800-53 | NIST 800-171 / CMMC L2 |"
+    echo "|---|---|---|---|---|"
+    for line in "${MANUAL[@]}"; do
+      IFS='|' read -r -a f <<<"$line"
+      echo "| ${f[0]} | ${f[1]} | ${f[2]} | ${f[3]} | ${f[4]} |"
+    done
+  } >"$md"
+  {
+    printf '{\n  "device": "%s",\n  "system": "%s",\n  "checked": "%s",\n  "legion_version": "%s",\n  "checks": [\n' \
+      "$(json_esc "$(hostname)")" "$(json_esc "$(osr PRETTY_NAME)")" "$now" "$LEGION_VERSION"
+    for i in "${!R_ID[@]}"; do
+      IFS='|' read -r -a f <<<"${R_MAP[i]}"
+      printf '    {"id": "%s", "check": "%s", "result": "%s", "note": "%s", "soc2": "%s", "hipaa": "%s", "nist_800_53": "%s", "nist_800_171": "%s"}%s\n' \
+        "${R_ID[i]}" "$(json_esc "${R_TITLE[i]}")" "${R_STATUS[i]}" "$(json_esc "${R_NOTE[i]}")" \
+        "${f[0]}" "${f[1]}" "${f[2]}" "${f[3]}" "$([ "$i" -lt $((${#R_ID[@]} - 1)) ] && echo ,)"
+    done
+    printf '  ]\n}\n'
+  } >"$js"
+  chmod 640 "$md" "$js"
+}
+
+# One archive with the reports, recent logs and Legion's settings, plus a
+# SHA-256 checksum, so an auditor can confirm nothing was changed afterwards.
+make_bundle() {
+  local dir="$LOGDIR/evidence" name tmp b f
+  install -d -m 750 "$dir"
+  name="legion-evidence-$(hostname)-$(date -u +%Y%m%dT%H%M%SZ)"
+  tmp="$(mktemp -d)"
+  b="$tmp/$name"
+  install -d "$b/reports" "$b/logs" "$b/settings" "$b/status"
+  cp "$LOGDIR"/compliance-report.* "$b/reports/" 2>/dev/null || true
+  cp "$LOGDIR"/cis-scap-report.html "$b/reports/" 2>/dev/null || true
+  [ ! -s "$RUNLOG" ] || cp "$RUNLOG" "$b/logs/"
+  for f in yara-scan.log integrity.log; do [ ! -f "$LOGDIR/$f" ] || tail -n 2000 "$LOGDIR/$f" >"$b/logs/$f"; done
+  for f in /etc/audit/rules.d/legion.rules /etc/systemd/journald.conf.d/legion.conf \
+    /etc/security/pwquality.conf.d/legion.conf /etc/sysctl.d/60-legion-hardening.conf \
+    /etc/modprobe.d/legion-uncommon-net.conf /etc/apt/apt.conf.d/20auto-upgrades /etc/legion/aide.conf \
+    /etc/dconf/db/local.d/00-legion-screenlock /etc/dconf/db/gdm.d/01-legion-banner /etc/issue \
+    /etc/pam.d/common-auth /etc/pam.d/common-account; do
+    [ ! -f "$f" ] || cp "$f" "$b/settings/$(echo "${f#/}" | tr / _)"
+  done
+  {
+    echo "== ufw"; ufw status verbose 2>&1
+    echo; echo "== ubuntu pro"; pro status 2>&1
+    echo; echo "== audit rules"; auditctl -l 2>&1
+    echo; echo "== legion timers"; systemctl list-timers --all --no-pager 'legion*' 'clamscan*' 2>&1
+    echo; echo "== failed units"; systemctl --failed --no-pager 2>&1
+  } >"$b/status/status.txt"
+  (cd "$b" && find . -type f -print0 | sort -z | xargs -0 sha256sum >"$tmp/SHA256SUMS") && mv "$tmp/SHA256SUMS" "$b/SHA256SUMS"
+  tar -C "$tmp" -czf "$dir/$name.tar.gz" "$name"
+  (cd "$dir" && sha256sum "$name.tar.gz" >"$name.tar.gz.sha256")
+  chmod 640 "$dir/$name.tar.gz" "$dir/$name.tar.gz.sha256"
+  rm -rf "$tmp"
+  # Keep the 30 most recent bundles.
+  find "$dir" -maxdepth 1 -name 'legion-evidence-*.tar.gz' -printf '%T@ %p\n' | sort -rn | awk 'NR > 30 { print $2 }' |
+    while read -r f; do rm -f "$f" "$f.sha256"; done
+  BUNDLE="$dir/$name.tar.gz"
+}
+
+section "Compliance checks"
+run_checks
+FAILS=0 NEW_FAILS=""
+LAST="$STATE/last-check"
+for i in "${!R_ID[@]}"; do
+  label="${R_TITLE[i]}"
+  [ -z "${R_NOTE[i]}" ] || label="$label ${C_DIM}(${R_NOTE[i]})${C_RST}"
+  case "${R_STATUS[i]}" in
+    pass) [ "$DRIFT_ONLY" = 1 ] || ok "$label" ;;
+    fail)
+      FAILS=$((FAILS + 1))
+      [ "$DRIFT_ONLY" = 1 ] || fail "$label"
+      if [ -f "$LAST" ] && grep -qx "${R_ID[i]} pass" "$LAST"; then NEW_FAILS="$NEW_FAILS ${R_ID[i]}"; fi
+      ;;
+    *) [ "$DRIFT_ONLY" = 1 ] || info "$label" ;;
+  esac
+done
+for i in "${!R_ID[@]}"; do echo "${R_ID[i]} ${R_STATUS[i]}"; done >"$LAST"
+
+set +e
+write_reports
+make_bundle
+set -e
+
+section "Frameworks"
+for col in 0 1 2 3; do
+  p=0 n=0
+  for i in "${!R_ID[@]}"; do
+    IFS='|' read -r -a f <<<"${R_MAP[i]}"
+    [ "${f[col]}" != "-" ] || continue
+    case "${R_STATUS[i]}" in pass) p=$((p + 1)) ;; fail) n=$((n + 1)) ;; esac
+  done
+  if [ "$n" = 0 ]; then ok "${FRAMEWORKS[col]}: all $p device checks pass"
+  else fail "${FRAMEWORKS[col]}: $p pass, $n fail"; fi
+done
+info "report: $LOGDIR/compliance-report.md (and .json)"
+info "evidence bundle: ${BUNDLE:-not created}"
+info "${#MANUAL[@]} items need evidence from outside this device; listed in the report"
+[ "$READONLY" = 1 ] || info "run log: $RUNLOG"
+
+if [ "$DRIFT_ONLY" = 1 ]; then
+  if [ -n "$NEW_FAILS" ]; then fail "checks that passed before and now fail:$NEW_FAILS"; exit 1; fi
+  exit 0
+fi
+if [ "$READONLY" = 1 ]; then
+  [ "$CHECK" = 1 ] && [ "$REPORT_ONLY" = 0 ] && [ "$FAILS" -gt 0 ] && exit 1
+  exit 0
+fi
 
 section "Result"
 if [ "$FAILED" = 0 ]; then
