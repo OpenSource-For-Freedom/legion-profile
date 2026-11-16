@@ -151,24 +151,36 @@ banner() {
   [ "${cols:-0}" -gt 0 ] 2>/dev/null || cols="$(tput cols 2>/dev/null)"
   [ "${cols:-0}" -gt 0 ] 2>/dev/null || cols="${COLUMNS:-80}"
   if [ "$UTF8" = 1 ] && [ -n "$C_RST" ] && [ "${cols:-0}" -ge 80 ]; then logo=1; logo_lines; fi
+  # Tagline and framework tags go under the lettering.
+  local tag t sub tags=("SOC 2" "HIPAA" "FedRAMP" "NIST 800-171" "CMMC L2")
+  sub="${C_DIM}P R O F I L E   ·   endpoint hardening${C_RST}"
+  tag=""
+  for t in "${tags[@]}"; do tag+="${tag:+ ${C_DIM}·${C_RST} }${C_INFO}${t}${C_RST}"; done
   if [ "$logo" = 1 ]; then
+    # Right of the 13 logo rows: lettering on rows 2-7, tagline on 9, tags on
+    # 10, so the block is centred on the logo.
     for i in "${!LOGO_LINES[@]}"; do
-      n=$((i - 3)) # centres the 6 letter rows on the 13 logo rows
+      n=$((i - 2))
       if [ "$n" -ge 0 ] && [ "$n" -lt "${#lines[@]}" ]; then
         printf '  %s   \e[38;5;%sm%s\e[0m\n' "${LOGO_LINES[i]}" "${grad[n]}" "${lines[n]}" >&3
+      elif [ "$i" = 9 ]; then
+        printf '  %s   %s\n' "${LOGO_LINES[i]}" "$sub" >&3
+      elif [ "$i" = 10 ]; then
+        printf '  %s   %s\n' "${LOGO_LINES[i]}" "$tag" >&3
       else
         printf '  %s\n' "${LOGO_LINES[i]}" >&3
       fi
       [ "$ANIM" = 0 ] || sleep 0.04
     done
+    echo >&3
   else
     for i in "${!lines[@]}"; do
       if [ -n "$C_RST" ]; then printf '  \e[38;5;%sm%s\e[0m\n' "${grad[i]}" "${lines[i]}" >&3
       else printf '  %s\n' "${lines[i]}" >&3; fi
       [ "$ANIM" = 0 ] || sleep 0.07
     done
+    printf '  %s\n  %s\n\n' "$sub" "$tag" >&3
   fi
-  printf '  %sP R O F I L E   ·   endpoint hardening   ·   SOC 2 evidence%s\n\n' "$C_DIM" "$C_RST" >&3
   if [ "$ANIM" = 1 ]; then
     local w=40 p full empty fill="#" rest="."
     [ "$UTF8" = 0 ] || { fill="█"; rest="░"; }
