@@ -14,6 +14,12 @@ bash legion.sh
 
 It asks for your sudo password, checks the system, asks for an Ubuntu Pro token (optional), then runs each step and shows the result.
 
+To skip the token question:
+
+```bash
+UBUNTU_PRO_SECRET=your-token bash legion.sh
+```
+
 Supported: Ubuntu 24.04 and 26.04, x86_64 and arm64.
 
 Reboot when it finishes.

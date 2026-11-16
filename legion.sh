@@ -27,6 +27,7 @@
 #   --report-only        change nothing; only write the evidence report
 #   -h, --help           show this help
 #
+# Set UBUNTU_PRO_SECRET to your Ubuntu Pro token to skip the token question.
 # Set NO_COLOR=1 for plain output, LEGION_NO_ANIM=1 to skip the animation.
 set -euo pipefail
 
@@ -128,6 +129,9 @@ if [ "$(id -u)" != 0 ]; then
   [ -f "$SELF" ] || { fail "cannot find this script on disk; run it as: sudo bash legion.sh"; exit 2; }
   command -v sudo >/dev/null || { fail "sudo is not installed; run this as root"; exit 2; }
   info "administrator access needed, asking sudo"
+  if [ -n "${UBUNTU_PRO_SECRET:-}" ]; then
+    exec sudo --preserve-env=UBUNTU_PRO_SECRET bash "$SELF" --banner-shown "${ARGS[@]}"
+  fi
   exec sudo bash "$SELF" --banner-shown "${ARGS[@]}"
 fi
 
@@ -231,6 +235,9 @@ pro_attached() { command -v pro >/dev/null && pro status --format json 2>/dev/nu
 if [ "$REPORT_ONLY" = 0 ] && [ "$PRO" = 1 ]; then
   if pro_attached; then
     ok "Ubuntu Pro: already attached"
+  elif [ -n "${UBUNTU_PRO_SECRET:-}" ]; then
+    PRO_TOKEN="${UBUNTU_PRO_SECRET//[[:space:]]/}"
+    ok "Ubuntu Pro: token taken from UBUNTU_PRO_SECRET"
   elif [ -n "$PRO_TOKEN_FILE" ]; then
     PRO_TOKEN="$(tr -d '[:space:]' <"$PRO_TOKEN_FILE")"
     if [ -n "$PRO_TOKEN" ]; then ok "Ubuntu Pro: token read from file"; else fail "Ubuntu Pro: token file is empty"; exit 2; fi
@@ -246,6 +253,7 @@ if [ "$REPORT_ONLY" = 0 ] && [ "$PRO" = 1 ]; then
     info "Ubuntu Pro: skipped (no terminal to ask; use --pro-token-file)"
   fi
 fi
+unset UBUNTU_PRO_SECRET # no later command needs it in its environment
 WITH_PRO=0
 [ -z "$PRO_TOKEN" ] || WITH_PRO=1
 
@@ -365,20 +373,14 @@ step_pro() {
     apt-get update -q -o DPkg::Lock::Timeout=300
     apt-get "${APT[@]}" install ubuntu-pro-client
   fi
-  # The token goes through a private file, not the command line, so it never
-  # shows up in the process list.
+  # Same as `pro attach TOKEN` with Pro's default services (ESM and, where
+  # the kernel supports it, Livepatch). The token goes through a private file
+  # because command-line arguments are visible to every user in `ps`.
   local cfg="$FLAGS/pro-attach.yaml"
-  (umask 077 && printf 'token: %s\nenable_services:\n  - esm-infra\n  - esm-apps\n' "$PRO_TOKEN" >"$cfg")
+  (umask 077 && printf 'token: %s\n' "$PRO_TOKEN" >"$cfg")
   pro attach --attach-config "$cfg"
   rm -f "$cfg"
   apt-get update -q -o DPkg::Lock::Timeout=300
-  if [ "$IN_CONTAINER" = 1 ]; then
-    info "Livepatch: not available in a container"
-  elif pro enable livepatch; then
-    info "Livepatch enabled: kernel security fixes without a reboot"
-  else
-    warn "Livepatch could not be enabled on this kernel; ESM updates are on"
-  fi
   info "$(pro status 2>/dev/null | awk '$2 == "yes" && $3 == "enabled" { s = s " " $1 } END { print "enabled:" s }')"
 }
 
