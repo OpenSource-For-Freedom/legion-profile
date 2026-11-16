@@ -3,6 +3,8 @@
 ![Legion Profile](docs/legion-banner.png)
 
 Legion hardens Ubuntu 26.04 laptops and desktops and reports on them. Each check maps to SOC 2, HIPAA, NIST 800-53 (FedRAMP) and NIST 800-171 (CMMC Level 2) controls. Every run writes a report and an evidence bundle with checksums for auditors.
+## Development Stage:
+- Testing
 
 CIS and DISA STIG have not published benchmarks for Ubuntu 26.04 yet. Until they do, Legion uses the CIS Ubuntu 24.04 rules that apply to 26.04. When the official benchmark comes out, Legion runs it automatically.
 
