@@ -1,18 +1,37 @@
 # Legion Profile
 
-One script that hardens an Ubuntu laptop or desktop and writes an evidence report for SOC 2 endpoint controls. It also adds YARA malware scanning and file integrity monitoring.
+A single script that hardens an Ubuntu laptop or desktop and writes an evidence report you can hand to a SOC 2 auditor. It goes past SOC 2 with YARA malware scanning and file integrity monitoring.
 
-## Before you start
+## What it covers
 
-**Encrypt the disk when you install Ubuntu.** Full-disk encryption can only be turned on during installation (Advanced features, then Use LVM and encryption). It cannot be added later without wiping the disk. Do this before the device is set up or handed to anyone. Legion checks for it and asks before continuing on an unencrypted disk.
+- **Ubuntu Pro**: security updates for every package (ESM) and Livepatch. Optional, needs your free token from https://ubuntu.com/pro/dashboard
+- **Updates**: installs all pending updates and turns on daily automatic security updates
+- **Firewall**: blocks incoming connections, allows outgoing
+- **Audit logging**: records changes to accounts, sudo, system time, kernel modules and the firewall
+- **Log retention**: keeps system logs for 1 year
+- **Malware scanning**: ClamAV weekly, plus YARA weekly with the YARA Forge core rules
+- **File integrity**: daily check of installed package files and of /etc, /boot, /usr/local and /root
+- **Password policy**: new passwords need 12+ characters and 3 character types
+- **System hardening**: safer kernel settings, unused network protocols blocked, tighter cron and sudoers permissions
+- **Evidence report**: `/var/log/legion/endpoint-report.txt`
 
-## Run it
+It does not set up disk encryption, backups, device management (MDM) or central logging. SOC 2 also covers policies and processes that no script can.
+
+## Before you run it
+
+**Encrypt the disk when you install Ubuntu.** Encryption can only be turned on during installation (Advanced features, then Use LVM and encryption). It cannot be added later without wiping the disk.
+
+## How to run it
+
+Works on Ubuntu 24.04 and 26.04.
 
 ```bash
+git clone https://github.com/OpenSource-For-Freedom/legion-profile.git
+cd legion-profile
 bash legion.sh
 ```
 
-It asks for your sudo password, checks the system, asks for an Ubuntu Pro token (optional), then runs each step and shows the result.
+It asks for your sudo password and your Ubuntu Pro token (press Enter to skip), then runs each step and shows the result. Reboot when it finishes.
 
 To skip the token question:
 
@@ -20,51 +39,4 @@ To skip the token question:
 UBUNTU_PRO_SECRET=your-token bash legion.sh
 ```
 
-Supported: Ubuntu 24.04 and 26.04, x86_64 and arm64.
-
-Reboot when it finishes.
-
-## What it does
-
-| Step | What it sets up |
-|---|---|
-| Ubuntu Pro | Security updates for every package (ESM) and Livepatch. Needs a token from your Ubuntu One account at https://ubuntu.com/pro/dashboard. Free for up to 5 personal machines. |
-| Patching | Installs all pending updates |
-| Automatic updates | Security updates install daily |
-| Firewall | Blocks incoming connections, allows outgoing |
-| Audit logging | Records changes to accounts, sudo, time, kernel modules and the firewall |
-| Log retention | Keeps system logs for 1 year, up to 2 GB |
-| ClamAV | Weekly malware scan of /home |
-| Password policy | New passwords need 12+ characters and 3 character types |
-| System hardening | Safe kernel settings, blocks unused network protocols, locks down cron and sudoers permissions |
-| YARA | Weekly scan of /home, /root and temp folders with the YARA Forge core rules |
-| Integrity | Daily check of package files against their checksums, and AIDE for /etc, /boot, /usr/local, /root and cron |
-
-## Options
-
-| Option | Effect |
-|---|---|
-| `--allow-unencrypted` | Continue on an unencrypted disk without asking |
-| `--pro-token-file FILE` | Read the Ubuntu Pro token from a file instead of asking |
-| `--no-pro` | Skip Ubuntu Pro |
-| `--no-yara` | Skip the YARA scan |
-| `--no-aide` | Skip the integrity check |
-| `--steam` | Allow Steam Remote Play on the local network |
-| `--with-tools` | Also install lynis, gitleaks, pre-commit, shellcheck, Deja Dup, Bitwarden, Terraform and Trivy |
-| `--report-only` | Change nothing, only write the report |
-
-## Results
-
-- Report: `/var/log/legion/endpoint-report.txt`
-- Run log: `/var/log/legion/run-*.log`
-- YARA results: `/var/log/legion/yara-scan.log`
-- Integrity results: `/var/log/legion/integrity.log`
-
-A ClamAV, YARA or integrity finding marks its service as failed. Check with `systemctl --failed`.
-
-## Good to know
-
-- This does not make an organisation SOC 2 compliant. SOC 2 covers policies, access reviews and more. This covers one device.
-- Docker bypasses the firewall for published container ports.
-- It does not set up backups, MDM, or central logging.
-- Safe to run again.
+Run `bash legion.sh --help` for all options. It is safe to run again.
