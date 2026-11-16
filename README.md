@@ -40,3 +40,13 @@ UBUNTU_PRO_SECRET=your-token bash legion.sh
 ```
 
 Run `bash legion.sh --help` for all options. It is safe to run again.
+
+## How to remove it
+
+If something breaks, this undoes Legion's settings and puts Ubuntu's defaults back:
+
+```bash
+bash legion-remove.sh
+```
+
+It keeps installed updates, Ubuntu Pro and your logs. Add `--remove-packages`, `--detach-pro` or `--purge-logs` to remove those too. Reboot afterwards.

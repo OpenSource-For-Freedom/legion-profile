@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+# Legion Profile removal: undoes the changes legion.sh made and puts Ubuntu's
+# defaults back. Use it if something breaks after running Legion.
+#
+# Usage:
+#   bash legion-remove.sh [options]       (asks for your sudo password)
+#
+# Options:
+#   --remove-packages  also uninstall auditd, ClamAV, YARA and AIDE
+#   --detach-pro       also detach this machine from Ubuntu Pro
+#   --purge-logs       also delete /var/log/legion (your evidence reports)
+#   -y, --yes          don't ask for confirmation
+#   -h, --help         show this help
+#
+# Kept on purpose: installed updates, the automatic security update setting
+# (Ubuntu's default too), and the packages Ubuntu ships with (ufw,
+# unattended-upgrades, libpam-pwquality). Removing libpam-pwquality would
+# rewrite the login configuration, so this script never does.
+set -euo pipefail
+
+exec 3>&1
+UTF8=0
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in *[Uu][Tt][Ff]-8* | *[Uu][Tt][Ff]8*) UTF8=1 ;; esac
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  C_OK=$'\e[32m' C_FAIL=$'\e[31m' C_INFO=$'\e[36m' C_WARN=$'\e[33m' C_BOLD=$'\e[1m' C_RST=$'\e[0m'
+else
+  C_OK="" C_FAIL="" C_INFO="" C_WARN="" C_BOLD="" C_RST=""
+fi
+if [ "$UTF8" = 1 ]; then I_OK="✔" I_FAIL="✖" I_INFO="ℹ" I_WARN="!"; else I_OK="ok" I_FAIL="FAIL" I_INFO="i" I_WARN="!"; fi
+ok() { printf '  %s%s%s %s\n' "$C_OK" "$I_OK" "$C_RST" "$*" >&3; }
+fail() { printf '  %s%s%s %s\n' "$C_FAIL" "$I_FAIL" "$C_RST" "$*" >&3; }
+info() { printf '  %s%s%s %s\n' "$C_INFO" "$I_INFO" "$C_RST" "$*" >&3; }
+warn() { printf '  %s%s%s %s\n' "$C_WARN" "$I_WARN" "$C_RST" "$*" >&3; }
+section() { printf '\n%s%s%s\n' "$C_BOLD" "$*" "$C_RST" >&3; }
+
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; }
+
+REMOVE_PACKAGES=0 DETACH_PRO=0 PURGE_LOGS=0 YES=0
+ARGS=()
+for arg in "$@"; do
+  case "$arg" in
+    --remove-packages) REMOVE_PACKAGES=1 ;;
+    --detach-pro) DETACH_PRO=1 ;;
+    --purge-logs) PURGE_LOGS=1 ;;
+    -y | --yes) YES=1 ;;
+    -h | --help) usage; exit 0 ;;
+    *) echo "unknown option: $arg (see --help)" >&2; exit 2 ;;
+  esac
+  ARGS+=("$arg")
+done
+
+if [ "$(id -u)" != 0 ]; then
+  SELF="$(readlink -f "$0" 2>/dev/null || true)"
+  [ -f "$SELF" ] || { fail "cannot find this script on disk; run it as: sudo bash legion-remove.sh"; exit 2; }
+  info "administrator access needed, asking sudo"
+  exec sudo bash "$SELF" "${ARGS[@]}"
+fi
+
+section "Legion Profile removal"
+info "this undoes Legion's settings and puts Ubuntu's defaults back"
+[ "$REMOVE_PACKAGES" = 0 ] || warn "also uninstalling auditd, ClamAV, YARA and AIDE"
+[ "$DETACH_PRO" = 0 ] || warn "also detaching from Ubuntu Pro"
+[ "$PURGE_LOGS" = 0 ] || warn "also deleting /var/log/legion, including your evidence reports"
+if [ "$YES" = 0 ]; then
+  if [ -t 0 ] && [ -t 1 ]; then
+    printf '  %s?%s remove Legion Profile from this machine? [y/N] ' "$C_WARN" "$C_RST" >&3
+    read -r reply
+    case "$reply" in [Yy]*) ;; *) info "cancelled, nothing changed"; exit 0 ;; esac
+  else
+    info "no terminal to confirm on; run with --yes"; exit 2
+  fi
+fi
+
+FAILED=0
+# Runs one undo action; reports it and carries on if it fails.
+undo() { # label, command...
+  local label="$1"; shift
+  if "$@" >/dev/null 2>&1; then ok "$label"; else fail "$label"; FAILED=$((FAILED + 1)); fi
+}
+unit_off() { # stops, disables and deletes a unit Legion created
+  local u
+  for u in "$@"; do
+    systemctl disable --now "$u" 2>/dev/null || true
+    rm -f "/etc/systemd/system/$u"
+  done
+}
+
+section "Scheduled scans and checks"
+undo "YARA weekly scan removed" bash -c "$(declare -f unit_off); unit_off legion-yara-scan.timer legion-yara-scan.service; rm -f /usr/local/sbin/legion-yara-update /usr/local/sbin/legion-yara-scan"
+undo "integrity check removed (AIDE and package checks)" bash -c "$(declare -f unit_off); unit_off legion-integrity.timer legion-integrity.service; rm -f /usr/local/sbin/legion-aide-baseline /usr/local/sbin/legion-integrity-check /etc/apt/apt.conf.d/99legion-aide; rm -rf /etc/legion"
+undo "Ubuntu's own daily AIDE timer unmasked" bash -c 'systemctl unmask dailyaidecheck.timer 2>/dev/null || true'
+undo "ClamAV weekly scan removed" bash -c "$(declare -f unit_off); unit_off clamscan-home.timer clamscan-home.service"
+undo "Legion state removed (/var/lib/legion)" rm -rf /var/lib/legion
+systemctl daemon-reload
+
+section "System settings"
+if command -v ufw >/dev/null; then
+  # Delete only the rules Legion added (they carry its comments), then turn
+  # ufw off again, which is how Ubuntu ships.
+  # shellcheck disable=SC2016 # expanded by the inner shell
+  undo "firewall rules added by Legion deleted" bash -c '
+    while n="$(ufw status numbered | grep -E "# (mDNS LAN|Steam LAN)" | head -n 1 | sed -E "s/^\[ *([0-9]+)\].*/\1/")" && [ -n "$n" ]; do
+      ufw --force delete "$n" >/dev/null
+    done'
+  undo "firewall turned off (Ubuntu default)" ufw disable
+fi
+undo "audit rules removed" rm -f /etc/audit/rules.d/legion.rules /etc/audit/rules.d/soc2.rules
+if [ -f /etc/audit/auditd.conf ]; then
+  undo "audit log rotation back to Ubuntu default (5 files)" sed -i -E 's/^num_logs\s*=.*/num_logs = 5/' /etc/audit/auditd.conf
+fi
+if command -v augenrules >/dev/null && ! systemd-detect-virt --container -q 2>/dev/null; then
+  undo "audit rules reloaded" augenrules --load
+fi
+undo "log retention back to Ubuntu default" bash -c 'rm -f /etc/systemd/journald.conf.d/legion.conf /etc/systemd/journald.conf.d/soc2.conf; systemctl restart systemd-journald'
+undo "password policy back to Ubuntu default" rm -f /etc/security/pwquality.conf.d/legion.conf /etc/security/pwquality.conf.d/soc2.conf
+undo "kernel settings file removed" rm -f /etc/sysctl.d/60-legion-hardening.conf /etc/sysctl.d/60-soc2-hardening.conf
+if ! systemd-detect-virt --container -q 2>/dev/null; then
+  # Removing the file only takes effect at boot; set Ubuntu's values now too.
+  undo "kernel settings back to Ubuntu defaults" bash -c '
+    sysctl -q -w kernel.kptr_restrict=1 fs.suid_dumpable=2 fs.protected_fifos=1 net.core.bpf_jit_harden=0 \
+      net.ipv4.conf.all.log_martians=0 net.ipv4.conf.default.log_martians=0 \
+      net.ipv4.conf.all.send_redirects=1 net.ipv4.conf.default.send_redirects=1 && sysctl -q --system'
+fi
+undo "network protocol blocks removed" rm -f /etc/modprobe.d/legion-uncommon-net.conf /etc/modprobe.d/soc2-uncommon-net.conf
+# shellcheck disable=SC2016 # expanded by the inner shell
+undo "cron and sudoers permissions back to Ubuntu defaults" bash -c '
+  [ ! -f /etc/crontab ] || chmod 644 /etc/crontab
+  for d in /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /etc/cron.monthly; do [ ! -d "$d" ] || chmod 755 "$d"; done
+  [ ! -d /etc/sudoers.d ] || chmod 755 /etc/sudoers.d'
+rm -f /var/log/soc2-endpoint-report.txt
+
+if [ "$REMOVE_PACKAGES" = 1 ]; then
+  section "Packages"
+  export DEBIAN_FRONTEND=noninteractive
+  pkgs=()
+  for p in auditd audispd-plugins clamav clamav-freshclam yara aide aide-common; do
+    dpkg -s "$p" >/dev/null 2>&1 && pkgs+=("$p")
+  done
+  if [ "${#pkgs[@]}" -gt 0 ]; then
+    undo "uninstalled: ${pkgs[*]}" apt-get -y -q -o DPkg::Lock::Timeout=300 purge "${pkgs[@]}"
+    undo "unused dependencies removed" apt-get -y -q -o DPkg::Lock::Timeout=300 autoremove
+  else
+    info "none of Legion's packages are installed"
+  fi
+fi
+
+if [ "$DETACH_PRO" = 1 ]; then
+  section "Ubuntu Pro"
+  if command -v pro >/dev/null && pro status --format json 2>/dev/null | grep -q '"attached": *true'; then
+    undo "detached from Ubuntu Pro" pro detach --assume-yes
+  else
+    info "not attached to Ubuntu Pro"
+  fi
+fi
+
+if [ "$PURGE_LOGS" = 1 ]; then
+  undo "Legion logs and reports deleted" rm -rf /var/log/legion
+else
+  info "logs and reports kept in /var/log/legion (delete with --purge-logs)"
+fi
+
+section "Result"
+if [ "$FAILED" = 0 ]; then
+  ok "Legion Profile removed"
+  info "reboot to make sure every kernel setting is back to normal"
+else
+  fail "$FAILED step(s) could not be undone; see the lines marked above"
+  exit 1
+fi
