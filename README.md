@@ -2,6 +2,8 @@
 
 A single script that hardens an Ubuntu laptop or desktop and writes an evidence report you can hand to a SOC 2 auditor. It goes past SOC 2 with YARA malware scanning and file integrity monitoring.
 
+![Legion running on Ubuntu 26.04](docs/legion-run.png)
+
 ## What it covers
 
 - **Ubuntu Pro**: security updates for every package (ESM) and Livepatch. Optional, needs your free token from https://ubuntu.com/pro/dashboard

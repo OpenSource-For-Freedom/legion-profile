@@ -356,7 +356,8 @@ step_patching() {
   # GPU has no driver after the reboot.
   if lsmod 2>/dev/null | awk '$1 == "nvidia" { f = 1 } END { exit !f }'; then
     local newest
-    newest="$(find /lib/modules -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | sort -V | tail -n 1 || true)"
+    # Only version-named folders: some systems also have e.g. /lib/modules/kernel.
+    newest="$(find /lib/modules -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' -printf '%f\n' 2>/dev/null | sort -V | tail -n 1 || true)"
     if [ -z "$newest" ]; then
       info "NVIDIA driver loaded, but no kernels under /lib/modules to check"
     elif modinfo -k "$newest" nvidia >/dev/null 2>&1; then
