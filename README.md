@@ -2,24 +2,24 @@
 
 ![Legion Profile](docs/legion-banner.png)
 
-A single script that hardens an Ubuntu 26.04 laptop or desktop and proves it. Every check is mapped to SOC 2, HIPAA, NIST 800-53 (FedRAMP) and NIST 800-171 (CMMC Level 2) controls, and each run produces a report and a checksummed evidence bundle you can hand to an auditor.
+Legion hardens Ubuntu 26.04 laptops and desktops and reports on them. Each check maps to SOC 2, HIPAA, NIST 800-53 (FedRAMP) and NIST 800-171 (CMMC Level 2) controls. Every run writes a report and an evidence bundle with checksums for auditors.
 
-There is no official CIS or DISA STIG benchmark for Ubuntu 26.04 yet. Legion applies the CIS Ubuntu 24.04 rules that fit 26.04, and runs the official benchmark automatically once it is published.
+CIS and DISA STIG have not published benchmarks for Ubuntu 26.04 yet. Until they do, Legion uses the CIS Ubuntu 24.04 rules that apply to 26.04. When the official benchmark comes out, Legion runs it automatically.
 
 ## What it covers
 
-- **Ubuntu Pro**: security updates for every package (ESM) and Livepatch. Optional, needs your free token from https://ubuntu.com/pro/dashboard
-- **Updates**: installs all pending updates and turns on daily automatic security updates
-- **Firewall**: blocks incoming connections, allows outgoing
-- **Account lockout**: 5 failed logins lock an account for 30 minutes, then it unlocks by itself
-- **Login banner** and a **screen lock** after 10 minutes that users cannot turn off
-- **Password policy**: new passwords need 12+ characters and 3 character types
-- **Audit logging**: records changes to accounts, sudo, system time, kernel modules and the firewall
-- **Log retention**: keeps system logs for 1 year
-- **Malware scanning**: ClamAV weekly, plus YARA weekly with the YARA Forge core rules
-- **File integrity**: daily check of installed package files and of /etc, /boot, /usr/local and /root
-- **System hardening**: safer kernel settings, unused network protocols blocked, tighter cron and sudoers permissions
-- **Daily compliance check**: flags any check that starts failing
+- Ubuntu Pro: security updates for every package (ESM) and Livepatch. Optional. Needs your free token from https://ubuntu.com/pro/dashboard
+- Updates: installs all pending updates and turns on daily automatic security updates
+- Firewall: blocks incoming connections, allows outgoing
+- Account lockout: 5 failed logins lock an account for 30 minutes, then it unlocks by itself
+- Login banner, and a screen lock after 10 minutes that users cannot turn off
+- Password policy: new passwords need 12+ characters and 3 character types
+- Audit logging: records changes to accounts, sudo, system time, kernel modules and the firewall
+- Log retention: keeps system logs for 1 year
+- Malware scanning: ClamAV weekly, plus YARA weekly with the YARA Forge core rules
+- File integrity: daily check of installed package files and of /etc, /boot, /usr/local and /root
+- System hardening: safer kernel settings, unused network protocols blocked, tighter cron and sudoers permissions
+- Daily compliance check: flags any check that starts failing
 
 ## Before you run it
 
@@ -69,10 +69,10 @@ If something breaks, this undoes Legion's settings and puts Ubuntu's defaults ba
 bash legion-remove.sh
 ```
 
-It keeps installed updates, Ubuntu Pro and your logs. Add `--remove-packages`, `--detach-pro` or `--purge-logs` to remove those too. Reboot afterwards.
+It keeps installed updates, Ubuntu Pro and your logs. Add `--remove-packages`, `--detach-pro` or `--purge-logs` to remove those too. Reboot afterward.
 
-## Good to know
+## Notes
 
-- No script makes an organisation compliant. These frameworks also cover policies, training, backups and vendor agreements; the report lists what Legion cannot check.
+- No script makes an organization compliant. These frameworks also cover policies, training, backups and vendor agreements. The report lists what Legion cannot check.
 - FIPS-validated cryptography, required for FedRAMP and CMMC, is not yet available for Ubuntu 26.04. Legion reports it and picks it up once Ubuntu Pro offers it.
 - Docker bypasses the firewall for published container ports.

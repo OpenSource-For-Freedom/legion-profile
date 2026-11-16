@@ -5,7 +5,7 @@
 # Hardens the device, adds YARA malware scanning, file integrity monitoring
 # and account lockout, and writes a compliance report that maps every check to
 # SOC 2, HIPAA, NIST 800-53 (FedRAMP) and NIST 800-171 (CMMC Level 2) controls.
-# No script makes an organisation compliant: these frameworks also cover
+# No script makes an organization compliant: these frameworks also cover
 # policies, people and processes. Legion covers one device and proves it.
 #
 # SET UP DISK ENCRYPTION FIRST. Full-disk encryption can only be chosen when
@@ -100,7 +100,7 @@ LOGO_PX=(
   .........oooooooo.........
 )
 
-# Turns LOGO_PX into 13 coloured lines of half-block characters in LOGO_LINES.
+# Turns LOGO_PX into 13 colored lines of half-block characters in LOGO_LINES.
 logo_lines() {
   local fo fw bo bw r c t b top bot line z=$'\e[0m'
   if [[ "${COLORTERM:-}" == *truecolor* || "${COLORTERM:-}" == *24bit* ]]; then
@@ -144,7 +144,7 @@ banner() {
     lines=("L E G I O N")
   fi
   echo >&3
-  # The Ubuntu logo sits left of the lettering when there is colour, UTF-8 and
+  # The Ubuntu logo sits left of the lettering when there is color, UTF-8 and
   # room (80 columns); otherwise the lettering is shown alone.
   local cols logo=0 n
   cols="$({ stty size </dev/tty; } 2>/dev/null | awk '{ print $2 }')"
@@ -158,7 +158,7 @@ banner() {
   for t in "${tags[@]}"; do tag+="${tag:+ ${C_DIM}·${C_RST} }${C_INFO}${t}${C_RST}"; done
   if [ "$logo" = 1 ]; then
     # Right of the 13 logo rows: lettering on rows 2-7, tagline on 9, tags on
-    # 10, so the block is centred on the logo.
+    # 10, so the block is centered on the logo.
     for i in "${!LOGO_LINES[@]}"; do
       n=$((i - 2))
       if [ "$n" -ge 0 ] && [ "$n" -lt "${#lines[@]}" ]; then
@@ -1109,7 +1109,7 @@ c_log_protect() {
 c_time() {
   in_container && return 2
   [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = yes ] && return 0
-  NOTE="clock not synchronised"; return 1
+  NOTE="clock not synchronized"; return 1
 }
 c_clamav() {
   systemctl is-active -q clamav-freshclam && systemctl is-enabled -q clamscan-home.timer && return 0
@@ -1177,7 +1177,7 @@ c_kernel() {
     [ "$(sysctl -n fs.protected_fifos)" = 2 ] && [ "$(sysctl -n net.ipv4.conf.all.send_redirects)" = 0 ] && return 0
   NOTE="kernel settings differ (reboot, or run Legion again)"; return 1
 }
-c_aslr() { [ "$(sysctl -n kernel.randomize_va_space 2>/dev/null)" = 2 ] && return 0; NOTE="memory address randomisation is not full"; return 1; }
+c_aslr() { [ "$(sysctl -n kernel.randomize_va_space 2>/dev/null)" = 2 ] && return 0; NOTE="memory address randomization is not full"; return 1; }
 c_protocols() {
   grep -q 'install sctp /bin/false' /etc/modprobe.d/legion-uncommon-net.conf 2>/dev/null && return 0
   NOTE="unused network protocols are not blocked"; return 1
@@ -1227,14 +1227,14 @@ CHECKS=(
   "audit-rules|Audit rules for accounts, sudo, time, modules|c_audit_rules|CC7.2|164.312(b)|AU-2|3.3.1"
   "log-retention|System logs kept for 1 year|c_log_retention|CC7.2|164.312(b)|AU-11|3.3.1"
   "log-protection|Audit logs readable only by admins|c_log_protect|CC7.2|164.312(b)|AU-9|3.3.8"
-  "time-sync|Clock synchronised|c_time|CC7.2|164.312(b)|AU-8|3.3.7"
+  "time-sync|Clock synchronized|c_time|CC7.2|164.312(b)|AU-8|3.3.7"
   "clamav|ClamAV updates and weekly scan|c_clamav|CC6.8|164.308(a)(5)(ii)(B)|SI-3|3.14.2"
   "yara|YARA weekly scan|c_yara|CC6.8|164.308(a)(5)(ii)(B)|SI-3|3.14.5"
   "integrity|Daily file integrity check|c_integrity|CC7.1|164.312(c)(1)|SI-7|-"
   "secure-boot|Secure Boot|c_secureboot|CC6.8|-|SI-7(9)|-"
   "apparmor|AppArmor confinement|c_apparmor|CC6.8|-|AC-3(3)|-"
   "kernel|Kernel hardening settings|c_kernel|CC7.1|-|CM-6|3.4.2"
-  "aslr|Full memory address randomisation|c_aslr|CC6.8|-|SI-16|-"
+  "aslr|Full memory address randomization|c_aslr|CC6.8|-|SI-16|-"
   "password-policy|Password length and complexity|c_password|CC6.1|164.308(a)(5)(ii)(D)|IA-5(1)|3.5.7"
   "lockout|Lockout after failed logins|c_lockout|CC6.1|164.308(a)(5)(ii)(C)|AC-7|3.1.8"
   "empty-passwords|No accounts without a password|c_empty_passwords|CC6.1|164.312(d)|IA-2|3.5.2"
