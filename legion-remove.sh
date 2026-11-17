@@ -155,7 +155,7 @@ undo "Ubuntu's own daily AIDE timer restored" bash -c '
     systemctl enable --now dailyaidecheck.timer
   fi' _ "$B" "$REMOVE_PACKAGES"
 undo "ClamAV weekly scan removed" bash -c "$(declare -f unit_off); unit_off clamscan-home.timer clamscan-home.service"
-undo "daily compliance check and the legion command removed" bash -c "$(declare -f unit_off); unit_off legion-check.timer legion-check.service; rm -f /usr/local/sbin/legion"
+undo "daily compliance check, the legion command and its images removed" bash -c "$(declare -f unit_off); unit_off legion-check.timer legion-check.service; rm -f /usr/local/sbin/legion; rm -rf /usr/local/share/legion"
 undo "Legion state removed (/var/lib/legion)" rm -rf /var/lib/legion
 systemctl daemon-reload
 
