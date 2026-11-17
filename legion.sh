@@ -26,6 +26,12 @@
 #   --with-tools         also install lynis, gitleaks, pre-commit, shellcheck,
 #                        python3-venv, python3-pip, deja-dup, Bitwarden,
 #                        Terraform and Trivy
+#   --tailscale          allow incoming traffic over Tailscale (tailscale0)
+#   --allow-from CIDRS   allow incoming traffic from these private networks,
+#                        comma separated, e.g. 10.8.0.0/24,192.168.50.0/24
+#   --no-ipv6            turn IPv6 off (only if nothing on this device needs it)
+#   --ssh / --no-ssh     keep SSH reachable (rate-limited), or not; by default
+#                        Legion asks when an SSH server is running
 #   --no-lockout         skip the account lockout (5 failed logins lock an
 #                        account for 30 minutes, then it unlocks by itself)
 #   --check              change nothing; check the device against the profile,
@@ -36,6 +42,7 @@
 # After the first run Legion installs itself as `legion`, so later checks are
 # just: sudo legion --check
 #
+# Without these options Legion asks about Tailscale, private networks and IPv6.
 # Set UBUNTU_PRO_SECRET to your Ubuntu Pro token to skip the token question.
 # Set NO_COLOR=1 for plain output, LEGION_NO_ANIM=1 to skip the animation.
 set -euo pipefail
@@ -58,6 +65,9 @@ if [ "$UTF8" = 1 ]; then
 else
   I_OK="ok" I_FAIL="FAIL" I_INFO="i" I_WARN="!" SPIN=('|' '/' '-' "\\")
 fi
+# Tools such as ufw translate their output; Legion parses it, so everything
+# runs in a fixed English locale. (UTF-8 support was detected above.)
+export LC_ALL=C.UTF-8 LANGUAGE=
 RUNLOG=/dev/null
 CLR="" # clears a spinner line; only meaningful on a terminal
 [ ! -t 1 ] || CLR=$'\r\e[K'
@@ -257,6 +267,7 @@ usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' 
 
 ALLOW_UNENCRYPTED=0 STEAM=0 TOOLS=0 YARA=1 AIDE=1 PRO=1 LOCKOUT=1 REPORT_ONLY=0 CHECK=0 DRIFT_ONLY=0 BANNER_SHOWN=0
 PRO_TOKEN_FILE=""
+TAILSCALE="" ALLOW_FROM="" IPV6="" SSH_ALLOW="" RDP_ALLOW="" # empty means: ask
 ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -273,6 +284,16 @@ while [ $# -gt 0 ]; do
     --no-lockout) LOCKOUT=0 ;;
     --check) CHECK=1 ;;
     --drift-only) CHECK=1; DRIFT_ONLY=1 ;; # internal: daily timer; exit 1 only on new failures
+    --tailscale) TAILSCALE=1 ;;
+    --no-tailscale) TAILSCALE=0 ;;
+    --allow-from)
+      [ $# -ge 2 ] || { echo "--allow-from needs a list of networks, e.g. 10.8.0.0/24" >&2; exit 2; }
+      ALLOW_FROM="${2//,/ }"
+      ARGS+=("$1" "$2"); shift 2; continue ;;
+    --no-ipv6) IPV6=0 ;;
+    --ssh) SSH_ALLOW=1 ;;
+    --no-ssh) SSH_ALLOW=0 ;;
+    --ipv6) IPV6=1 ;;
     --report-only) REPORT_ONLY=1 ;;
     --banner-shown) BANNER_SHOWN=1; shift; continue ;; # internal: set when re-run through sudo
     -h | --help) usage; exit 0 ;;
@@ -332,14 +353,35 @@ root_encrypted() {
     return 1
   fi
   src="${src%%[*}" # btrfs shows /dev/x[/@]
-  types="$(lsblk -nso TYPE "$src" 2>/dev/null)" || return 1
-  grep -qx crypt <<<"$types"
+  types="$(lsblk -nso TYPE "$src" 2>/dev/null || true)"
+  if [ -n "$types" ]; then
+    grep -qx crypt <<<"$types"
+    return
+  fi
+  # lsblk printed nothing (seen in some sandboxes): walk the device-mapper
+  # stack in sysfs instead. A dm-crypt layer has a uuid starting with CRYPT-.
+  local dev queue=() u
+  dev="$(readlink -f "$src" 2>/dev/null)" && dev="${dev##*/}" || return 1
+  queue=("$dev")
+  while [ "${#queue[@]}" -gt 0 ]; do
+    dev="${queue[0]}" queue=("${queue[@]:1}")
+    u="$(cat "/sys/class/block/$dev/dm/uuid" 2>/dev/null || true)"
+    [[ "$u" == CRYPT-* ]] && return 0
+    for u in /sys/class/block/"$dev"/slaves/*; do [ -e "$u" ] && queue+=("${u##*/}"); done
+  done
+  return 1
 }
 
 # ---------------------------------------------------------------- preflight
 
 section "System check"
 info "run log: $RUNLOG"
+# The installed 'legion' command (used by the daily check) is refreshed by a
+# full run. Say so when it differs from the copy running now.
+if [ -x /usr/local/sbin/legion ] && [ "$SELF_PATH" != /usr/local/sbin/legion ] && ! cmp -s "$SELF_PATH" /usr/local/sbin/legion; then
+  if [ "$READONLY" = 1 ]; then warn "the installed 'legion' command is a different version; a full run updates it"
+  else info "the installed 'legion' command will be updated to this version"; fi
+fi
 if [ "$OS_ID" != ubuntu ]; then
   fail "operating system: ${OS_ID:-unknown}. Legion supports Ubuntu only"; exit 2
 fi
@@ -356,8 +398,18 @@ if [ "$IN_CONTAINER" = 1 ]; then info "running in a container: kernel settings a
 if [ "$READONLY" = 0 ]; then
   FREE_GB=$(($(df --output=avail -k / | tail -n 1) / 1024 / 1024))
   if [ "$FREE_GB" -ge 3 ]; then ok "free disk space: ${FREE_GB} GB"; else fail "free disk space: ${FREE_GB} GB (need 3 GB)"; exit 2; fi
-  # curl is not installed on a fresh Ubuntu Desktop, so test with a plain TCP connection.
-  if timeout 15 bash -c 'exec 9<>/dev/tcp/security.ubuntu.com/80' 2>/dev/null; then
+  # curl is not installed on a fresh Ubuntu Desktop, so test with plain TCP
+  # connections. Each address is tried briefly, IPv4 and IPv6 alike, so a
+  # network with broken IPv6 does not look offline.
+  net_ok() {
+    local a
+    for a in $(getent ahostsv4 security.ubuntu.com 2>/dev/null | awk '!seen[$1]++ { print $1 }' | head -n 3) \
+      $(getent ahostsv6 security.ubuntu.com 2>/dev/null | awk '!seen[$1]++ { print $1 }' | head -n 3); do
+      timeout 5 bash -c "exec 9<>/dev/tcp/$a/80" 2>/dev/null && return 0
+    done
+    return 1
+  }
+  if net_ok; then
     ok "network: Ubuntu archive reachable"
   else
     fail "network: cannot reach security.ubuntu.com"; exit 2
@@ -388,6 +440,80 @@ if command -v mokutil >/dev/null && mokutil --sb-state 2>/dev/null | grep -q ena
   ok "secure boot: enabled"
 else
   info "secure boot: off or unknown"
+fi
+
+# Network questions: the firewall blocks all incoming traffic, so ask what
+# must still reach this device. Answers can also come from options.
+ask_yn() { # question, default y or n; returns 0 for yes
+  local r hint="[y/N]"
+  [ "$2" = y ] && hint="[Y/n]"
+  printf '  %s?%s %s %s ' "$C_WARN" "$C_RST" "$1" "$hint" >&3
+  read -r r || r=""
+  r="${r:-$2}"
+  [[ "$r" == [Yy]* ]]
+}
+# A private network in CIDR form (IPv4 or IPv6). "Allow everything" ranges
+# are refused, since they would switch the firewall off.
+valid_cidr() {
+  case "$1" in 0.0.0.0/0 | ::/0 | 0.0.0.0/* | ::/*) return 1 ;; esac
+  [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$ ]] ||
+    [[ "$1" =~ ^[0-9A-Fa-f:]+:[0-9A-Fa-f:]*/([0-9]|[1-9][0-9]|1[01][0-9]|12[0-8])$ ]]
+}
+if [ "$READONLY" = 0 ]; then
+  INTERACTIVE=0
+  [ -t 0 ] && [ -t 1 ] && INTERACTIVE=1
+  [ "$INTERACTIVE" = 0 ] && [ -z "$TAILSCALE$IPV6" ] && info "no terminal: Tailscale off, IPv6 kept (use --tailscale, --allow-from, --no-ipv6)"
+  # SSH: keep it reachable when a server is running, so nobody is locked out.
+  # Running Legion over SSH always keeps it (newer OpenSSH names its session
+  # processes sshd-session).
+  over_ssh=0 p=$$
+  while [ "${p:-1}" -gt 1 ]; do
+    case "$(ps -o comm= -p "$p" 2>/dev/null)" in sshd*) over_ssh=1; break ;; esac
+    p="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"
+  done
+  listening() { ss -ltnH 2>/dev/null | awk -v port=":$1" '$4 ~ port"$" && $4 !~ /^(127\.|\[::1\])/ { f = 1 } END { exit !f }'; }
+  if [ "$over_ssh" = 1 ]; then
+    SSH_ALLOW=1
+    warn "you are connected over SSH: SSH stays allowed (rate-limited)"
+  elif [ -z "$SSH_ALLOW" ]; then
+    SSH_ALLOW=0
+    if listening 22; then
+      SSH_ALLOW=1
+      if [ "$INTERACTIVE" = 1 ]; then ask_yn "An SSH server is running. Keep SSH reachable (rate-limited)?" y || SSH_ALLOW=0; fi
+    fi
+  fi
+  [ "$SSH_ALLOW" = 1 ] && ok "SSH: allowed, rate-limited"
+  if listening 3389; then
+    RDP_ALLOW=1
+    if [ "$INTERACTIVE" = 1 ]; then ask_yn "Remote Desktop is on. Keep it reachable?" y || RDP_ALLOW=0; fi
+    [ "$RDP_ALLOW" = 1 ] && ok "Remote Desktop: allowed"
+  fi
+  if [ -z "$TAILSCALE" ]; then
+    TAILSCALE=0
+    ts_found=n
+    { command -v tailscale >/dev/null || ip link show tailscale0 >/dev/null 2>&1; } && ts_found=y
+    if [ "$INTERACTIVE" = 1 ]; then
+      [ "$ts_found" = y ] && info "Tailscale is installed on this device"
+      ask_yn "Do you use Tailscale, and should this device be reachable over it?" "$ts_found" && TAILSCALE=1
+    fi
+  fi
+  [ "$TAILSCALE" = 1 ] && ok "Tailscale: incoming traffic over tailscale0 allowed"
+  if [ -z "$ALLOW_FROM" ] && [ "$INTERACTIVE" = 1 ] &&
+    ask_yn "Do other private networks need to reach this device (for example an office VPN)?" n; then
+    printf '  %s?%s networks, separated by spaces (e.g. 10.8.0.0/24): ' "$C_WARN" "$C_RST" >&3
+    read -r ALLOW_FROM || ALLOW_FROM=""
+  fi
+  good=""
+  for net in $ALLOW_FROM; do
+    if valid_cidr "$net"; then good+=" $net"; else warn "ignored '$net': not a private network in CIDR form"; fi
+  done
+  ALLOW_FROM="${good# }"
+  [ -z "$ALLOW_FROM" ] || ok "private networks allowed in: $ALLOW_FROM"
+  if [ -z "$IPV6" ]; then
+    IPV6=1
+    if [ "$INTERACTIVE" = 1 ]; then ask_yn "Does this device need IPv6? (if unsure, answer yes)" y || IPV6=0; fi
+  fi
+  if [ "$IPV6" = 1 ]; then ok "IPv6: kept"; else warn "IPv6: will be turned off"; fi
 fi
 
 # Ubuntu Pro: security updates for every package (ESM) and Livepatch. The
@@ -422,6 +548,38 @@ WITH_PRO=0
 
 # ---------------------------------------------------------------- helpers
 
+# Keeps a copy of a file the first time Legion changes it, so legion-remove.sh
+# can restore the original. A missing file is recorded as NAME.absent.
+backup_once() { # file [name]
+  local b="$STATE/backup/${2:-${1##*/}}"
+  install -d -m 700 "$STATE/backup"
+  [ -e "$b" ] || [ -e "$b.absent" ] || { if [ -e "$1" ]; then cp -p "$1" "$b"; else : >"$b.absent"; fi; }
+}
+
+# Adds a firewall rule labelled for Legion, unless the same rule already
+# exists (with any label). An existing rule belongs to the user and is left
+# alone, so legion-remove.sh never deletes it.
+ufw_allow() { # label, rule words...
+  local label="$1"
+  shift
+  if ufw show added 2>/dev/null | sed -E "s/ comment '.*'$//" | grep -qxF "ufw allow $*"; then
+    info "firewall rule already present, left as is: ufw allow $*"
+  else
+    ufw allow "$@" comment "Legion: $label"
+  fi
+}
+
+ufw_rule() { # verb (e.g. limit, "route allow"), label, rule words...
+  local verb="$1" label="$2"
+  shift 2
+  # shellcheck disable=SC2086 # the verb may be two words
+  if ufw show added 2>/dev/null | sed -E "s/ comment '.*'$//" | grep -qxF "ufw $verb $*"; then
+    info "firewall rule already present, left as is: ufw $verb $*"
+  else
+    ufw $verb "$@" comment "Legion: $label"
+  fi
+}
+
 # Installs each package this release provides; leaves the rest in MISSING.
 install_available() {
   local p cand have=()
@@ -453,6 +611,7 @@ add_signed_repo() {
   install -m 644 "$tmp" "/usr/share/keyrings/$keyring"
   rm -f "$tmp"
   echo "deb [signed-by=/usr/share/keyrings/$keyring] $source" >"/etc/apt/sources.list.d/$list"
+  echo "$list $keyring" >>"$STATE/created-repos"
   if apt-get update -q && apt-get "${APT[@]}" install "$pkg"; then return 0; fi
   warn "$pkg: install failed; removing its repository again"
   rm -f "/etc/apt/sources.list.d/$list" "/usr/share/keyrings/$keyring"
@@ -461,7 +620,7 @@ add_signed_repo() {
 }
 
 STEP=0
-TOTAL=$((10 + WITH_PRO + YARA + AIDE + LOCKOUT + TOOLS))
+TOTAL=$((11 + WITH_PRO + YARA + AIDE + LOCKOUT + TOOLS))
 RESULTS=()
 FAILED=0
 
@@ -510,13 +669,15 @@ step_patching() {
   apt-get update -q -o DPkg::Lock::Timeout=300
   apt-get "${APT[@]}" full-upgrade
   apt-get "${APT[@]}" install curl gpg ca-certificates iproute2 needrestart
-  apt-get "${APT[@]}" autoremove
-  # Remove config files left behind by packages that were removed earlier.
-  local rc_pkgs
-  rc_pkgs="$(dpkg -l | awk '/^rc/ { print $2 }')"
-  [ -z "$rc_pkgs" ] || echo "$rc_pkgs" | xargs dpkg --purge
-  # A kernel update must come with the NVIDIA module for that kernel, or the
-  # GPU has no driver after the reboot.
+  # No "apt autoremove" and no purging of leftover package configs: both can
+  # delete things people need. Autoremove can take out the whole desktop
+  # session, and purging a removed docker.io deletes /var/lib/docker.
+}
+
+# A kernel update must come with the NVIDIA module for that kernel, or the GPU
+# has no driver after the reboot. Its own step, so it runs even when patching
+# failed partway.
+step_nvidia() {
   if lsmod 2>/dev/null | awk '$1 == "nvidia" { f = 1 } END { exit !f }'; then
     local newest
     # Only version-named folders: some systems also have e.g. /lib/modules/kernel.
@@ -550,6 +711,7 @@ step_pro() {
 
 step_auto_updates() {
   apt-get "${APT[@]}" install unattended-upgrades
+  backup_once /etc/apt/apt.conf.d/20auto-upgrades
   cat >/etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
@@ -564,30 +726,65 @@ step_firewall() {
   local iface lan=""
   iface="$(ip -4 route show default | awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }')"
   [ -z "$iface" ] || lan="$(ip -4 route show dev "$iface" scope link proto kernel | awk '{ print $1; exit }')"
+  # Remember ufw's state and settings before Legion's first change, so
+  # legion-remove.sh can put back exactly what was there.
+  if [ ! -e "$STATE/backup/ufw-was-active" ] && [ ! -e "$STATE/backup/ufw-was-inactive" ]; then
+    install -d -m 700 "$STATE/backup"
+    if ufw status 2>/dev/null | grep -q 'Status: active'; then : >"$STATE/backup/ufw-was-active"; else : >"$STATE/backup/ufw-was-inactive"; fi
+    backup_once /etc/default/ufw ufw-default
+    backup_once /etc/ufw/ufw.conf ufw.conf
+  fi
   ufw default deny incoming
   ufw default allow outgoing
   ufw logging low
   if [ -n "$lan" ]; then
     info "local network: $lan on $iface"
-    ufw allow from "$lan" to any port 5353 proto udp comment 'mDNS LAN'
+    ufw_allow "mDNS LAN" from "$lan" to any port 5353 proto udp
     if [ "$STEAM" = 1 ]; then
-      ufw allow from "$lan" to any port 27031:27036 proto udp comment 'Steam LAN'
-      ufw allow from "$lan" to any port 27036:27037 proto tcp comment 'Steam LAN'
+      ufw_allow "Steam LAN" from "$lan" to any port 27031:27036 proto udp
+      ufw_allow "Steam LAN" from "$lan" to any port 27036:27037 proto tcp
     fi
   else
     warn "no default route found; no local network exceptions added"
   fi
+  [ "$SSH_ALLOW" != 1 ] || ufw_rule limit "SSH" 22/tcp
+  [ "$RDP_ALLOW" != 1 ] || ufw_allow "Remote Desktop" 3389/tcp
+  [ "$TAILSCALE" != 1 ] || ufw_allow "Tailscale" in on tailscale0
+  # Virtual machines (libvirt): DHCP and DNS on the bridge, and their traffic
+  # through this machine, keep working.
+  if ip link show virbr0 >/dev/null 2>&1; then
+    ufw_allow "virtual machines" in on virbr0
+    ufw_rule "route allow" "virtual machines" in on virbr0
+    ufw_rule "route allow" "virtual machines" out on virbr0
+  fi
+  local net
+  for net in $ALLOW_FROM; do ufw_allow "private network" from "$net"; done
   ufw --force enable
 }
 
 step_audit() {
   apt-get "${APT[@]}" install auditd audispd-plugins
+  backup_once /etc/audit/auditd.conf
   local b32=""
   # 32-bit system call rules only apply on x86_64.
   if [ "$ARCH" = x86_64 ]; then
     b32="-a always,exit -F arch=b32 -S adjtimex,settimeofday,clock_settime,stime -k time
 -a always,exit -F arch=b32 -S init_module,finit_module,delete_module -k modules"
   fi
+  # Exec watches go on the real program, not a link to it: on Ubuntu 26.04
+  # /usr/bin/sudo links to sudo-rs and modprobe/insmod link to kmod, and a
+  # watch on a link never fires.
+  local prog real priv="" mods="" seen=" "
+  for prog in /usr/bin/sudo /usr/bin/su; do
+    real="$(readlink -f "$prog" 2>/dev/null || true)"
+    [ -x "$real" ] && [[ "$seen" != *" $real "* ]] || continue
+    seen+="$real " priv+="-w $real -p x -k privilege"$'\n'
+  done
+  for prog in /usr/sbin/insmod /usr/sbin/modprobe /usr/sbin/rmmod /sbin/insmod /sbin/modprobe; do
+    real="$(readlink -f "$prog" 2>/dev/null || true)"
+    [ -x "$real" ] && [[ "$seen" != *" $real "* ]] || continue
+    seen+="$real " mods+="-w $real -p x -k modules"$'\n'
+  done
   cat >/etc/audit/rules.d/legion.rules <<EOF
 # Identity and privilege changes
 -w /etc/passwd -p wa -k identity
@@ -598,18 +795,16 @@ step_audit() {
 -w /etc/sudoers.d/ -p wa -k privilege
 # Authentication and session records
 -w /var/log/auth.log -p wa -k auth
--w /var/log/faillog -p wa -k auth
+-w /run/faillock/ -p wa -k auth
 -w /var/log/lastlog -p wa -k logins
 # Privilege escalation
--w /usr/bin/sudo -p x -k privilege
--w /usr/bin/su -p x -k privilege
+${priv%$'\n'}
 # Time changes and kernel modules
 -a always,exit -F arch=b64 -S adjtimex,settimeofday,clock_settime -k time
 -a always,exit -F arch=b64 -S init_module,finit_module,delete_module -k modules
 $b32
 -w /etc/localtime -p wa -k time
--w /sbin/insmod -p x -k modules
--w /sbin/modprobe -p x -k modules
+${mods%$'\n'}
 # Firewall and audit config itself
 -w /etc/ufw/ -p wa -k firewall
 -w /etc/audit/ -p wa -k audit-config
@@ -680,6 +875,16 @@ step_hardening() {
   # Low-risk subset of the Lynis/CIS kernel checks. Left alone on purpose:
   # ip_forward (Docker and VMs need it), rp_filter (VPNs), sysrq,
   # modules_disabled and unprivileged_bpf_disabled (Ubuntu's default is fine).
+  if [ ! -f "$STATE/backup/sysctl" ] && [ "$IN_CONTAINER" = 0 ]; then
+    install -d -m 700 "$STATE/backup"
+    local key
+    for key in kernel.kptr_restrict fs.suid_dumpable fs.protected_fifos net.core.bpf_jit_harden \
+      net.ipv4.conf.all.log_martians net.ipv4.conf.default.log_martians \
+      net.ipv4.conf.all.send_redirects net.ipv4.conf.default.send_redirects \
+      net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6; do
+      echo "$key=$(sysctl -n "$key" 2>/dev/null)"
+    done >"$STATE/backup/sysctl"
+  fi
   cat >/etc/sysctl.d/60-legion-hardening.conf <<'EOF'
 kernel.kptr_restrict = 2
 fs.suid_dumpable = 0
@@ -693,6 +898,36 @@ EOF
   if [ "$IN_CONTAINER" = 0 ]; then
     sysctl -q -p /etc/sysctl.d/60-legion-hardening.conf || warn "some kernel settings apply only after a reboot"
   fi
+  # IPv6 off only when the user said it is not needed; a later run that keeps
+  # IPv6 turns it back on.
+  # The loopback interface keeps IPv6, since local services such as Postfix
+  # expect ::1. NetworkManager turns IPv6 back on for a network when it
+  # connects, so it is also set off in each saved Wi-Fi and wired connection
+  # (their old settings are kept for legion-remove.sh).
+  local uuid type method nmb="$STATE/backup/nm-ipv6"
+  if [ "$IPV6" = 0 ]; then
+    printf 'net.ipv6.conf.all.disable_ipv6 = 1\nnet.ipv6.conf.default.disable_ipv6 = 1\nnet.ipv6.conf.lo.disable_ipv6 = 0\n' >/etc/sysctl.d/60-legion-ipv6.conf
+    [ "$IN_CONTAINER" = 1 ] || sysctl -q -p /etc/sysctl.d/60-legion-ipv6.conf || warn "IPv6 setting applies after a reboot"
+    if command -v nmcli >/dev/null 2>&1; then
+      install -d -m 700 "$STATE/backup"
+      while IFS=: read -r uuid type; do
+        case "$type" in 802-11-wireless | 802-3-ethernet) ;; *) continue ;; esac
+        method="$(nmcli -g ipv6.method connection show "$uuid" 2>/dev/null || true)"
+        [ "$method" = disabled ] && continue
+        grep -q "^$uuid " "$nmb" 2>/dev/null || echo "$uuid ${method:-auto}" >>"$nmb"
+        nmcli connection modify "$uuid" ipv6.method disabled || warn "could not change network connection $uuid"
+      done < <(nmcli -t -f UUID,TYPE connection show 2>/dev/null || true)
+    fi
+    info "IPv6 turned off; Wi-Fi and wired connections pick this up when they next connect"
+  elif [ -f /etc/sysctl.d/60-legion-ipv6.conf ]; then
+    rm -f /etc/sysctl.d/60-legion-ipv6.conf
+    [ "$IN_CONTAINER" = 1 ] || sysctl -q -w net.ipv6.conf.all.disable_ipv6=0 net.ipv6.conf.default.disable_ipv6=0 || true
+    if [ -f "$nmb" ] && command -v nmcli >/dev/null 2>&1; then
+      while read -r uuid method; do nmcli connection modify "$uuid" ipv6.method "$method" 2>/dev/null || true; done <"$nmb"
+      rm -f "$nmb"
+    fi
+    info "IPv6 turned back on"
+  fi
   # Network protocols a laptop never uses; each has had kernel vulnerabilities.
   cat >/etc/modprobe.d/legion-uncommon-net.conf <<'EOF'
 install dccp /bin/false
@@ -702,7 +937,7 @@ install tipc /bin/false
 EOF
   [ ! -f /etc/crontab ] || chmod 600 /etc/crontab
   local d
-  for d in /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /etc/cron.monthly; do
+  for d in /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /etc/cron.monthly /etc/cron.yearly; do
     [ ! -d "$d" ] || chmod 700 "$d"
   done
   [ ! -d /etc/sudoers.d ] || chmod 750 /etc/sudoers.d
@@ -754,6 +989,8 @@ EOF
 # Scans user-writable folders with the compiled rules. Exits 1 when a rule
 # matches, so the systemd unit shows as failed; exits 2 if the scan can't run.
 set -uo pipefail
+umask 027
+export LC_ALL=C.UTF-8
 RULES=/var/lib/legion/yara/rules.yarc
 LOG=/var/log/legion/yara-scan.log
 [ -s "$RULES" ] || { echo "no compiled rules at $RULES; run legion-yara-update" >&2; exit 2; }
@@ -815,8 +1052,13 @@ step_integrity() {
   #   run made are logged first.
   # Ubuntu's own daily AIDE job, which scans the whole system, is turned off so
   # nothing is scanned twice. auditd still records who changed key files.
-  apt-get "${APT[@]}" install aide
+  # Without recommended packages: aide-common pulls in a mail client and with
+  # it Postfix, a mail server. Legion uses its own AIDE setup and needs neither.
+  apt-get "${APT[@]}" install --no-install-recommends aide
   # Stop it before masking; masking a running timer leaves it "failed".
+  install -d -m 700 "$STATE/backup"
+  [ -e "$STATE/backup/dailyaidecheck-state" ] ||
+    systemctl is-enabled dailyaidecheck.timer >"$STATE/backup/dailyaidecheck-state" 2>/dev/null || true
   systemctl disable --now dailyaidecheck.timer >/dev/null 2>&1 || true
   systemctl mask dailyaidecheck.timer >/dev/null 2>&1 || true
   systemctl reset-failed dailyaidecheck.timer >/dev/null 2>&1 || true
@@ -837,8 +1079,12 @@ Legion = p+u+g+s+ftype+sha512+acl+xattrs
 /etc Legion
 /boot Legion
 /usr/local Legion
-/root Legion
 /var/spool/cron Legion
+# In /root, only what changes how root logs in or starts programs; history,
+# cache and editor files change whenever an admin uses a root shell.
+/root/\.ssh Legion
+/root/\.(bashrc|profile|bash_profile|bash_login|bash_logout)$ Legion
+/root/\.config/autostart Legion
 
 # Change in normal use
 !/etc/mtab$
@@ -849,14 +1095,14 @@ Legion = p+u+g+s+ftype+sha512+acl+xattrs
 !/etc/cups/.*\.O$
 !/etc/NetworkManager/system-connections
 !/boot/grub/grubenv$
-!/root/\.cache
-!/root/snap
 EOF
   cat >/usr/local/sbin/legion-aide-baseline <<'EOF'
 #!/usr/bin/env bash
 # Records the current state as the AIDE baseline. Called by the installer and
 # after every apt run; logs what changed since the previous baseline.
 set -uo pipefail
+umask 027
+export LC_ALL=C.UTF-8
 CONF=/etc/legion/aide.conf
 DB=/var/lib/legion/aide/aide.db
 LOG=/var/log/legion/integrity.log
@@ -879,6 +1125,8 @@ EOF
 # Daily integrity check. Exits 1 when a package file or an AIDE-watched file
 # changed, so the systemd unit shows as failed; exits 2 if a check can't run.
 set -uo pipefail
+umask 027
+export LC_ALL=C.UTF-8
 LOG=/var/log/legion/integrity.log
 status=0
 # Package files. Ignored: config files (AIDE covers /etc) and missing docs,
@@ -928,11 +1176,15 @@ EOF
 }
 
 step_tools() {
+  local before p
+  before=" $(dpkg-query -W -f '${Package} ' 2>/dev/null) "
   local missing_all=""
   install_available lynis gitleaks pre-commit shellcheck python3-venv python3-pip deja-dup
   missing_all="$MISSING"
   if command -v snap >/dev/null 2>&1; then
-    snap list bitwarden >/dev/null 2>&1 || snap install bitwarden || missing_all="$missing_all bitwarden"
+    if ! snap list bitwarden >/dev/null 2>&1; then
+      if snap install bitwarden; then BITWARDEN_NEW=1; else missing_all="$missing_all bitwarden"; fi
+    fi
   else
     missing_all="$missing_all bitwarden(no snap)"
   fi
@@ -950,6 +1202,11 @@ step_tools() {
     825AD9036F7C850E6A6FED4935B8ACA44FD9CA9F \
     "https://aquasecurity.github.io/trivy-repo/deb generic main" trivy ||
     missing_all="$missing_all trivy"
+  # Record what this run installed, for legion-remove.sh --remove-packages.
+  for p in lynis gitleaks pre-commit shellcheck python3-venv python3-pip deja-dup terraform trivy; do
+    [[ "$before" == *" $p "* ]] || ! dpkg -s "$p" >/dev/null 2>&1 || echo "apt $p" >>"$STATE/installed-tools"
+  done
+  if [ -n "${BITWARDEN_NEW:-}" ]; then echo "snap bitwarden" >>"$STATE/installed-tools"; fi
   [ -z "$missing_all" ] || warn "not installed:$missing_all"
 }
 
@@ -977,7 +1234,7 @@ step_login() {
   install -d -m 755 /etc/dconf/profile /etc/dconf/db/local.d/locks /etc/dconf/db/gdm.d
   # Login screen banner. GDM reads the "gdm" dconf profile; the /etc copy is
   # Ubuntu's own profile with Legion's system database added.
-  if [ ! -f /etc/dconf/profile/gdm ] && [ -f /usr/share/dconf/profile/gdm ]; then
+  if [ -f /usr/share/dconf/profile/gdm ] && { [ ! -f /etc/dconf/profile/gdm ] || [ -f "$STATE/backup/created-dconf-profile-gdm" ]; }; then
     awk '{ print } /^user-db:user$/ { print "system-db:gdm" }' /usr/share/dconf/profile/gdm >/etc/dconf/profile/gdm
     : >"$STATE/backup/created-dconf-profile-gdm"
   fi
@@ -1090,6 +1347,9 @@ if [ "$READONLY" = 0 ]; then
   section "Deploying profile"
   [ "$WITH_PRO" = 0 ] || run_step "Ubuntu Pro: ESM security updates and Livepatch" step_pro
   run_step "Patching: install all pending updates" step_patching
+  PATCH_FAILED=0
+  [ "${RESULTS[${#RESULTS[@]} - 1]%%|*}" = ok ] || PATCH_FAILED=1
+  run_step "NVIDIA driver ready for the new kernel" step_nvidia
   run_step "Automatic security updates" step_auto_updates
   run_step "Firewall: block inbound, allow outbound" step_firewall
   run_step "Audit logging (auditd)" step_audit
@@ -1103,6 +1363,11 @@ if [ "$READONLY" = 0 ]; then
   [ "$LOCKOUT" = 0 ] || run_step "Account lockout: 5 failed logins, 30 minutes" step_lockout
   [ "$TOOLS" = 0 ] || run_step "Tools: audit, secrets, backups, Terraform, Trivy" step_tools
   run_step "Compliance: daily check, SCAP content" step_compliance
+  # Legion's own later steps change files AIDE watches; accept them (logged in
+  # integrity.log) so the next daily check does not report them.
+  if [ -x /usr/local/sbin/legion-aide-baseline ] && [ -f "$STATE/aide/aide.db" ]; then
+    /usr/local/sbin/legion-aide-baseline "legion run" >/dev/null 2>&1 || warn "could not refresh the AIDE baseline"
+  fi
 fi
 
 # ---------------------------------------------------------------- compliance
@@ -1134,7 +1399,9 @@ c_fips() {
 }
 c_updates() {
   local n
-  n="$(apt-get -s -o Debug::NoLocking=1 upgrade 2>/dev/null | grep -c '^Inst .*-security' || true)"
+  # dist-upgrade, not upgrade: it also counts security updates that need new
+  # dependencies, which a plain upgrade holds back silently.
+  n="$(apt-get -s -o Debug::NoLocking=1 dist-upgrade 2>/dev/null | grep -c '^Inst .*-security' || true)"
   [ "$n" = 0 ] && return 0
   NOTE="$n security updates pending"; return 1
 }
@@ -1186,17 +1453,26 @@ c_time() {
   [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = yes ] && return 0
   NOTE="clock not synchronized"; return 1
 }
+# A scan whose last run failed (it found something, or could not run) fails
+# its check until the cause is dealt with and the scan runs clean.
+last_run_failed() { systemctl is-failed -q "$1" 2>/dev/null; }
 c_clamav() {
-  systemctl is-active -q clamav-freshclam && systemctl is-enabled -q clamscan-home.timer && return 0
-  NOTE="ClamAV updates or weekly scan not running"; return 1
+  if ! systemctl is-active -q clamav-freshclam || ! systemctl is-enabled -q clamscan-home.timer; then
+    NOTE="ClamAV updates or weekly scan not running"; return 1
+  fi
+  ! last_run_failed clamscan-home.service || { NOTE="the last ClamAV scan found something; see /var/log/clamscan-home.log"; return 1; }
 }
 c_yara() {
-  systemctl is-enabled -q legion-yara-scan.timer 2>/dev/null && [ -s "$STATE/yara/rules.yarc" ] && return 0
-  NOTE="YARA scan not set up (run Legion without --no-yara)"; return 1
+  if ! systemctl is-enabled -q legion-yara-scan.timer 2>/dev/null || [ ! -s "$STATE/yara/rules.yarc" ]; then
+    NOTE="YARA scan not set up (run Legion without --no-yara)"; return 1
+  fi
+  ! last_run_failed legion-yara-scan.service || { NOTE="the last YARA scan found something; see /var/log/legion/yara-scan.log"; return 1; }
 }
 c_integrity() {
-  systemctl is-enabled -q legion-integrity.timer 2>/dev/null && [ -f "$STATE/aide/aide.db" ] && return 0
-  NOTE="integrity check not set up (run Legion without --no-aide)"; return 1
+  if ! systemctl is-enabled -q legion-integrity.timer 2>/dev/null || [ ! -f "$STATE/aide/aide.db" ]; then
+    NOTE="integrity check not set up (run Legion without --no-aide)"; return 1
+  fi
+  ! last_run_failed legion-integrity.service || { NOTE="the last integrity check found changes; see /var/log/legion/integrity.log"; return 1; }
 }
 c_password() {
   local conf minlen minclass
@@ -1212,8 +1488,16 @@ c_lockout() {
   NOTE="no lockout after failed logins (run Legion without --no-lockout)"; return 1
 }
 c_banner() {
-  grep -qi 'authorized use only' /etc/issue 2>/dev/null && grep -qi 'authorized use only' /etc/issue.net 2>/dev/null && return 0
-  NOTE="no login banner"; return 1
+  if ! grep -qi 'authorized use only' /etc/issue 2>/dev/null || ! grep -qi 'authorized use only' /etc/issue.net 2>/dev/null; then
+    NOTE="no login banner on the console"; return 1
+  fi
+  # On a GNOME desktop the graphical login screen is the one people see.
+  if [ -f /usr/share/dconf/profile/gdm ] && command -v dconf >/dev/null; then
+    if ! grep -qx 'banner-message-enable=true' /etc/dconf/db/gdm.d/01-legion-banner 2>/dev/null ||
+      ! grep -qx 'system-db:gdm' /etc/dconf/profile/gdm 2>/dev/null; then
+      NOTE="no banner on the graphical login screen"; return 1
+    fi
+  fi
 }
 c_screenlock() {
   [ -f /usr/share/glib-2.0/schemas/org.gnome.desktop.screensaver.gschema.xml ] || { NOTE="no GNOME desktop"; return 2; }
@@ -1266,7 +1550,7 @@ c_protocols() {
 c_perms() {
   [ ! -f /etc/crontab ] || [ "$(stat -c %a /etc/crontab)" = 600 ] || { NOTE="/etc/crontab is readable by other users"; return 1; }
   local d
-  for d in /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /etc/cron.monthly; do
+  for d in /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /etc/cron.monthly /etc/cron.yearly; do
     [ ! -d "$d" ] || [ "$(stat -c %a "$d")" = 700 ] || { NOTE="$d is readable by other users"; return 1; }
   done
   [ ! -d /etc/sudoers.d ] || [ "$(stat -c %a /etc/sudoers.d)" = 750 ] || { NOTE="/etc/sudoers.d is readable by other users"; return 1; }
@@ -1465,7 +1749,10 @@ for i in "${!R_ID[@]}"; do
     fail)
       FAILS=$((FAILS + 1))
       [ "$DRIFT_ONLY" = 1 ] || fail "$label"
-      if [ -f "$LAST" ] && grep -qx "${R_ID[i]} pass" "$LAST"; then NEW_FAILS="$NEW_FAILS ${R_ID[i]}"; fi
+      case "${R_ID[i]}" in
+        time-sync | security-updates) ;; # short-lived after resume or a new update; not drift
+        *) if [ -f "$LAST" ] && grep -qx "${R_ID[i]} pass" "$LAST"; then NEW_FAILS="$NEW_FAILS ${R_ID[i]}"; fi ;;
+      esac
       ;;
     *) [ "$DRIFT_ONLY" = 1 ] || info "$label" ;;
   esac
@@ -1513,5 +1800,9 @@ if [ -f "$FLAGS/nvidia" ]; then
   fail "NOT READY TO REBOOT: $(cat "$FLAGS/nvidia")"
   exit 1
 fi
-info "reboot now to finish the kernel and library updates"
+if [ "${PATCH_FAILED:-0}" = 1 ]; then
+  fail "installing updates did not finish. Check the run log and fix it before you reboot"
+else
+  info "reboot now to finish the kernel and library updates"
+fi
 [ "$FAILED" = 0 ] || exit 1

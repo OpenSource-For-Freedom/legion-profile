@@ -35,7 +35,7 @@ cd legion-profile
 bash legion.sh
 ```
 
-It asks for your sudo password and your Ubuntu Pro token (press Enter to skip), then runs each step and shows the result. Reboot when it finishes.
+It asks for your sudo password, then a few questions so the firewall does not cut you off: whether to keep SSH or Remote Desktop reachable (if they are running), whether you use Tailscale, which private networks need to reach this device, and whether you need IPv6. It also asks for your Ubuntu Pro token (press Enter to skip). Then it runs each step and shows the result. Reboot when it finishes.
 
 To skip the token question:
 
@@ -63,6 +63,16 @@ A ClamAV, YARA, integrity or daily compliance finding marks its service as faile
 
 Wait 30 minutes, or have another admin run `sudo faillock --user NAME --reset`.
 
+## Testing
+
+Every change is tested in an Ubuntu 26.04 container with systemd:
+
+```bash
+bash tests/run.sh
+```
+
+It installs Legion, checks the firewall, lockout, integrity and scan results, runs Legion again, removes it and confirms the system is back to how it was. Containers cannot load audit rules or kernel settings, so those need a real machine or VM.
+
 ## How to remove it
 
 If something breaks, this undoes Legion's settings and puts Ubuntu's defaults back:
@@ -78,3 +88,4 @@ It keeps installed updates, Ubuntu Pro and your logs. Add `--remove-packages`, `
 - No script makes an organization compliant. These frameworks also cover policies, training, backups and vendor agreements. The report lists what Legion cannot check.
 - FIPS-validated cryptography, required for FedRAMP and CMMC, is not yet available for Ubuntu 26.04. Legion reports it and picks it up once Ubuntu Pro offers it.
 - Docker bypasses the firewall for published container ports.
+- Earlier versions of Legion installed the Postfix mail server as a side effect of installing AIDE. Legion now sets Postfix to accept connections from this device only. If nothing on your machine sends mail, you can remove it: `sudo apt purge postfix bsd-mailx`.
