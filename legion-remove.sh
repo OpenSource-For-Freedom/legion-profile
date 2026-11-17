@@ -96,12 +96,21 @@ for f in created-repos installed-tools; do [ ! -f "/var/lib/legion/$f" ] || cp "
 in_container() { systemd-detect-virt --container -q 2>/dev/null; }
 
 section "Login settings"
-if [ -f /usr/share/pam-configs/legion-faillock ] || [ -f /usr/share/pam-configs/legion-faillock-notify ]; then
-  undo "account lockout removed" bash -c '
-    pam-auth-update --disable legion-faillock legion-faillock-notify &&
+if [ -f /usr/share/pam-configs/legion-faillock ] || [ -f /usr/share/pam-configs/legion-faillock-notify ] ||
+  grep -qE '^[^#]*pam_faillock.so.*unlock_time=1800' /etc/pam.d/common-auth 2>/dev/null; then
+  # pam-auth-update leaves locally edited PAM files alone but still exits 0,
+  # so check the file itself. Legion's profiles are deleted only once the
+  # lockout is really gone; otherwise they are needed to finish the job.
+  pam-auth-update --disable legion-faillock legion-faillock-notify >/dev/null 2>&1 || true
+  if grep -qE '^[^#]*pam_faillock.so.*unlock_time=1800' /etc/pam.d/common-auth; then
+    fail "account lockout still active: /etc/pam.d/common-auth has local edits"
+    info "to finish, run: sudo pam-auth-update --force --disable legion-faillock legion-faillock-notify, then this script again"
+    FAILED=$((FAILED + 1))
+  else
+    undo "account lockout removed" bash -c '
       rm -f /usr/share/pam-configs/legion-faillock /usr/share/pam-configs/legion-faillock-notify &&
-      sed -i -E "/^legion-faillock(-notify)?$/d" /var/lib/pam/seen &&
-      ! grep -q "pam_faillock.so.*unlock_time=1800" /etc/pam.d/common-auth'
+        sed -i -E "/^legion-faillock(-notify)?$/d" /var/lib/pam/seen'
+  fi
 fi
 if [ -e "$B/issue" ] || [ -e "$B/issue.absent" ] || [ -e "$B/issue.net" ] || [ -e "$B/issue.net.absent" ]; then
   # shellcheck disable=SC2016 # expanded by the inner shell
@@ -224,7 +233,7 @@ if [ -f "$B/created-repos" ]; then
   # shellcheck disable=SC2016 # expanded by the inner shell
   undo "package sources added by Legion removed" bash -c '
     while read -r list key; do rm -f "/etc/apt/sources.list.d/$list" "/usr/share/keyrings/$key"; done <"$1"
-    apt-get update -q -o DPkg::Lock::Timeout=300 >/dev/null 2>&1 || true' _ "$B/created-repos"
+    for i in $(seq 30); do apt-get update -q >/dev/null 2>&1 && break; sleep 10; done' _ "$B/created-repos"
 fi
 rm -f /var/log/soc2-endpoint-report.txt
 

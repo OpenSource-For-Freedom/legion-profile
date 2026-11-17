@@ -52,7 +52,7 @@ set -euo pipefail
 exec 3>&1 # status lines always go to the terminal; step output goes to the log
 UTF8=0
 case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in *[Uu][Tt][Ff]-8* | *[Uu][Tt][Ff]8*) UTF8=1 ;; esac
-if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-}" != dumb ]; then
   C_OK=$'\e[32m' C_FAIL=$'\e[31m' C_INFO=$'\e[36m' C_WARN=$'\e[33m'
   C_BOLD=$'\e[1m' C_DIM=$'\e[2m' C_RST=$'\e[0m'
 else
@@ -267,7 +267,7 @@ usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' 
 
 ALLOW_UNENCRYPTED=0 STEAM=0 TOOLS=0 YARA=1 AIDE=1 PRO=1 LOCKOUT=1 REPORT_ONLY=0 CHECK=0 DRIFT_ONLY=0 BANNER_SHOWN=0
 PRO_TOKEN_FILE=""
-TAILSCALE="" ALLOW_FROM="" IPV6="" SSH_ALLOW="" RDP_ALLOW="" # empty means: ask
+TAILSCALE="" ALLOW_FROM="" ALLOW_FROM_SET=0 IPV6="" SSH_ALLOW="" RDP_ALLOW="" # empty means: ask
 ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -288,7 +288,7 @@ while [ $# -gt 0 ]; do
     --no-tailscale) TAILSCALE=0 ;;
     --allow-from)
       [ $# -ge 2 ] || { echo "--allow-from needs a list of networks, e.g. 10.8.0.0/24" >&2; exit 2; }
-      ALLOW_FROM="${2//,/ }"
+      ALLOW_FROM="${2//,/ }" ALLOW_FROM_SET=1
       ARGS+=("$1" "$2"); shift 2; continue ;;
     --no-ipv6) IPV6=0 ;;
     --ssh) SSH_ALLOW=1 ;;
@@ -308,15 +308,18 @@ READONLY=0
 LEGION_VERSION="2026.11"
 [ "$BANNER_SHOWN" = 1 ] || [ "$DRIFT_ONLY" = 1 ] || banner
 
+# Legion installs a copy of itself for the daily check, so it must run from a
+# file, not from a pipe such as "curl ... | bash".
+SELF="$(readlink -f "$0" 2>/dev/null || true)"
+if [ ! -f "$SELF" ] || ! grep -q '^LEGION_VERSION=' "$SELF" 2>/dev/null; then
+  fail "run Legion from a file: download legion.sh, then run: bash legion.sh"; exit 2
+fi
 if [ "$(id -u)" != 0 ]; then
-  SELF="$(readlink -f "$0" 2>/dev/null || true)"
-  [ -f "$SELF" ] || { fail "cannot find this script on disk; run it as: sudo bash legion.sh"; exit 2; }
   command -v sudo >/dev/null || { fail "sudo is not installed; run this as root"; exit 2; }
   info "administrator access needed, asking sudo"
-  if [ -n "${UBUNTU_PRO_SECRET:-}" ]; then
-    exec sudo --preserve-env=UBUNTU_PRO_SECRET bash "$SELF" --banner-shown "${ARGS[@]}"
-  fi
-  exec sudo bash "$SELF" --banner-shown "${ARGS[@]}"
+  keep="NO_COLOR,LEGION_NO_ANIM"
+  [ -z "${UBUNTU_PRO_SECRET:-}" ] || keep+=",UBUNTU_PRO_SECRET"
+  exec sudo --preserve-env="$keep" bash "$SELF" --banner-shown "${ARGS[@]}"
 fi
 
 # ---------------------------------------------------------------- setup
@@ -328,7 +331,16 @@ LOGDIR=/var/log/legion
 STATE=/var/lib/legion
 install -d -m 750 "$LOGDIR"
 install -d -m 700 "$STATE"
-RUNLOG="$LOGDIR/run-$(date +%Y%m%d-%H%M%S).log"
+# One Legion run at a time.
+# The daily drift check waits for a run in progress; anything else stops.
+exec 9>/run/legion.lock
+if [ "$DRIFT_ONLY" = 1 ]; then
+  flock -w 1800 9 || { fail "Legion is still running after 30 minutes"; exit 2; }
+elif ! flock -n 9; then
+  fail "Legion is already running"; exit 2
+fi
+RUNLOG="$LOGDIR/run-$(date +%Y%m%d-%H%M%S)-$$.log"
+find "$LOGDIR" -maxdepth 1 -name 'run-*.log' -printf '%T@ %p\n' 2>/dev/null | sort -rn | awk 'NR > 60 { print $2 }' | xargs -r rm -f
 : >"$RUNLOG"
 chmod 640 "$RUNLOG"
 FLAGS="$(mktemp -d)" # steps run in subshells and leave notes for the summary here
@@ -349,8 +361,7 @@ root_encrypted() {
   src="$(findmnt -no SOURCE /)" || return 1
   fstype="$(findmnt -no FSTYPE /)"
   if [ "$fstype" = zfs ]; then
-    [ "$(zfs get -H -o value encryption "$src" 2>/dev/null)" != off ] && return 0
-    return 1
+    case "$(zfs get -H -o value encryption "$src" 2>/dev/null || true)" in "" | off | -) return 1 ;; *) return 0 ;; esac
   fi
   src="${src%%[*}" # btrfs shows /dev/x[/@]
   types="$(lsblk -nso TYPE "$src" 2>/dev/null || true)"
@@ -411,6 +422,8 @@ if [ "$READONLY" = 0 ]; then
   }
   if net_ok; then
     ok "network: Ubuntu archive reachable"
+  elif [ -n "$(apt-config dump 2>/dev/null | grep -iE '^Acquire::(http|https)::Proxy ' || true)" ] || [ -n "${https_proxy:-}${http_proxy:-}" ]; then
+    warn "network: no direct connection to security.ubuntu.com, but a proxy is set; continuing"
   else
     fail "network: cannot reach security.ubuntu.com"; exit 2
   fi
@@ -454,10 +467,17 @@ ask_yn() { # question, default y or n; returns 0 for yes
 }
 # A private network in CIDR form (IPv4 or IPv6). "Allow everything" ranges
 # are refused, since they would switch the firewall off.
+# Only private ranges (10/8, 172.16/12, 192.168/16, fd00::/8, ...) with a
+# prefix of at least /8 (IPv4) or /16 (IPv6); anything else is refused.
 valid_cidr() {
-  case "$1" in 0.0.0.0/0 | ::/0 | 0.0.0.0/* | ::/*) return 1 ;; esac
-  [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$ ]] ||
-    [[ "$1" =~ ^[0-9A-Fa-f:]+:[0-9A-Fa-f:]*/([0-9]|[1-9][0-9]|1[01][0-9]|12[0-8])$ ]]
+  python3 -I -c '
+import ipaddress, sys
+try:
+    n = ipaddress.ip_network(sys.argv[1], strict=False)
+except ValueError:
+    sys.exit(1)
+ok = n.is_private and not n.is_loopback and not n.is_link_local and not n.is_unspecified
+sys.exit(0 if ok and n.prefixlen >= (8 if n.version == 4 else 16) else 1)' "$1" 2>/dev/null
 }
 if [ "$READONLY" = 0 ]; then
   INTERACTIVE=0
@@ -498,7 +518,8 @@ if [ "$READONLY" = 0 ]; then
     fi
   fi
   [ "$TAILSCALE" = 1 ] && ok "Tailscale: incoming traffic over tailscale0 allowed"
-  if [ -z "$ALLOW_FROM" ] && [ "$INTERACTIVE" = 1 ] &&
+  [ "$ALLOW_FROM" != none ] || ALLOW_FROM=""
+  if [ "$ALLOW_FROM_SET" = 0 ] && [ "$INTERACTIVE" = 1 ] &&
     ask_yn "Do other private networks need to reach this device (for example an office VPN)?" n; then
     printf '  %s?%s networks, separated by spaces (e.g. 10.8.0.0/24): ' "$C_WARN" "$C_RST" >&3
     read -r ALLOW_FROM || ALLOW_FROM=""
@@ -580,6 +601,17 @@ ufw_rule() { # verb (e.g. limit, "route allow"), label, rule words...
   fi
 }
 
+# apt-get update, waiting up to 5 minutes while another apt (such as Ubuntu's
+# own daily update check) holds the package lists lock.
+apt_update() {
+  local i
+  for i in $(seq 30); do
+    apt-get update -q && return 0
+    [ "$i" = 30 ] || sleep 10
+  done
+  return 1
+}
+
 # Installs each package this release provides; leaves the rest in MISSING.
 install_available() {
   local p cand have=()
@@ -612,7 +644,7 @@ add_signed_repo() {
   rm -f "$tmp"
   echo "deb [signed-by=/usr/share/keyrings/$keyring] $source" >"/etc/apt/sources.list.d/$list"
   echo "$list $keyring" >>"$STATE/created-repos"
-  if apt-get update -q && apt-get "${APT[@]}" install "$pkg"; then return 0; fi
+  if apt_update && apt-get "${APT[@]}" install "$pkg"; then return 0; fi
   warn "$pkg: install failed; removing its repository again"
   rm -f "/etc/apt/sources.list.d/$list" "/usr/share/keyrings/$keyring"
   apt-get update -q || true
@@ -666,7 +698,10 @@ step_patching() {
   rm -f /etc/audit/rules.d/soc2.rules /etc/systemd/journald.conf.d/soc2.conf \
     /etc/security/pwquality.conf.d/soc2.conf /etc/sysctl.d/60-soc2-hardening.conf \
     /etc/modprobe.d/soc2-uncommon-net.conf /var/log/soc2-endpoint-report.txt
-  apt-get update -q -o DPkg::Lock::Timeout=300
+  # Finish any package install that was interrupted (power loss, a kill).
+  dpkg --configure -a
+  apt-get "${APT[@]}" -f install
+  apt_update
   apt-get "${APT[@]}" full-upgrade
   apt-get "${APT[@]}" install curl gpg ca-certificates iproute2 needrestart
   # No "apt autoremove" and no purging of leftover package configs: both can
@@ -695,7 +730,7 @@ step_nvidia() {
 
 step_pro() {
   if ! command -v pro >/dev/null; then
-    apt-get update -q -o DPkg::Lock::Timeout=300
+    apt_update
     apt-get "${APT[@]}" install ubuntu-pro-client
   fi
   # Same as `pro attach TOKEN` with Pro's default services (ESM and, where
@@ -705,7 +740,7 @@ step_pro() {
   (umask 077 && printf 'token: %s\n' "$PRO_TOKEN" >"$cfg")
   pro attach --attach-config "$cfg"
   rm -f "$cfg"
-  apt-get update -q -o DPkg::Lock::Timeout=300
+  apt_update
   info "$(pro status 2>/dev/null | awk '$2 == "yes" && $3 == "enabled" { s = s " " $1 } END { print "enabled:" s }')"
 }
 
@@ -758,7 +793,7 @@ step_firewall() {
     ufw_rule "route allow" "virtual machines" out on virbr0
   fi
   local net
-  for net in $ALLOW_FROM; do ufw_allow "private network" from "$net"; done
+  for net in $ALLOW_FROM; do ufw_allow "private network" from "$net" || warn "could not add a rule for $net"; done
   ufw --force enable
 }
 
@@ -944,9 +979,9 @@ EOF
   # A mail server only needs to accept mail from this device (CIS: mail
   # transfer agent in local-only mode). Local mail, such as cron reports,
   # keeps working. The old setting is kept for legion-remove.sh.
-  if command -v postconf >/dev/null 2>&1; then
+  if command -v postconf >/dev/null 2>&1 && [ -f /etc/postfix/main.cf ]; then
     local mta
-    mta="$(postconf -h inet_interfaces 2>/dev/null)"
+    mta="$(postconf -h inet_interfaces 2>/dev/null || true)"
     if [ -n "$mta" ] && [ "$mta" != loopback-only ]; then
       install -d -m 700 "$STATE/backup"
       [ -f "$STATE/backup/postfix-inet_interfaces" ] || printf '%s\n' "$mta" >"$STATE/backup/postfix-inet_interfaces"
@@ -1238,7 +1273,9 @@ step_login() {
     awk '{ print } /^user-db:user$/ { print "system-db:gdm" }' /usr/share/dconf/profile/gdm >/etc/dconf/profile/gdm
     : >"$STATE/backup/created-dconf-profile-gdm"
   fi
-  if grep -qx 'system-db:gdm' /etc/dconf/profile/gdm 2>/dev/null; then
+  if [ ! -f /etc/dconf/profile/gdm ] && [ ! -f /usr/share/dconf/profile/gdm ]; then
+    info "no GDM login screen found; graphical login banner skipped"
+  elif grep -qx 'system-db:gdm' /etc/dconf/profile/gdm 2>/dev/null; then
     cat >/etc/dconf/db/gdm.d/01-legion-banner <<EOF
 [org/gnome/login-screen]
 banner-message-enable=true
@@ -1398,6 +1435,12 @@ c_fips() {
   return 2
 }
 c_updates() {
+  # The answer is only as fresh as the package lists.
+  local newest age
+  newest="$(find /var/lib/apt/lists -maxdepth 1 -name '*InRelease' -printf '%T@\n' 2>/dev/null | sort -rn | head -n 1)"
+  if [ -z "$newest" ]; then NOTE="no package lists; run apt update"; return 1; fi
+  age=$(( ($(date +%s) - ${newest%.*}) / 86400 ))
+  if [ "$age" -gt 2 ]; then NOTE="package lists are $age days old, so pending updates are unknown"; return 1; fi
   local n
   # dist-upgrade, not upgrade: it also counts security updates that need new
   # dependencies, which a plain upgrade holds back silently.
@@ -1483,7 +1526,7 @@ c_password() {
   NOTE="passwords need at least 12 characters and 3 character types"; return 1
 }
 c_lockout() {
-  grep -q 'pam_faillock.so preauth' /etc/pam.d/common-auth 2>/dev/null &&
+  grep -qE '^[^#]*pam_faillock.so preauth' /etc/pam.d/common-auth 2>/dev/null &&
     grep -q 'pam_faillock.so authfail' /etc/pam.d/common-auth && return 0
   NOTE="no lockout after failed logins (run Legion without --no-lockout)"; return 1
 }
@@ -1757,7 +1800,14 @@ for i in "${!R_ID[@]}"; do
     *) [ "$DRIFT_ONLY" = 1 ] || info "$label" ;;
   esac
 done
-for i in "${!R_ID[@]}"; do echo "${R_ID[i]} ${R_STATUS[i]}"; done >"$LAST"
+# Saved state: a check that passed before and fails now stays recorded as
+# "pass", so the daily drift check keeps alerting until it is fixed.
+for i in "${!R_ID[@]}"; do
+  st="${R_STATUS[i]}"
+  if [ "$st" = fail ] && [ -f "$LAST" ] && grep -qx "${R_ID[i]} pass" "$LAST"; then st=pass; fi
+  echo "${R_ID[i]} $st"
+done >"$LAST.new"
+mv -f "$LAST.new" "$LAST"
 
 set +e
 write_reports

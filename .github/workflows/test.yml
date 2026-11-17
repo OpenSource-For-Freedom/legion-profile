@@ -1,0 +1,18 @@
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  scenario:
+    name: shellcheck and scenario tests (Ubuntu 26.04 container)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update -q && sudo apt-get install -y -q shellcheck
+      - name: Run the test suite
+        run: bash tests/run.sh
