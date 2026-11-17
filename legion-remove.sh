@@ -112,6 +112,11 @@ if [ -f /etc/dconf/db/gdm.d/01-legion-banner ] || [ -f /etc/dconf/db/local.d/00-
     dconf update' _ "$B"
 fi
 
+if [ -f /var/lib/legion/backup/postfix-inet_interfaces ] && command -v postconf >/dev/null; then
+  # shellcheck disable=SC2016 # expanded by the inner shell
+  undo "mail server network setting restored" bash -c 'postconf -e "inet_interfaces = $(cat "$1")" && { systemctl restart postfix 2>/dev/null || true; }' _ /var/lib/legion/backup/postfix-inet_interfaces
+fi
+
 section "Scheduled scans and checks"
 undo "YARA weekly scan removed" bash -c "$(declare -f unit_off); unit_off legion-yara-scan.timer legion-yara-scan.service; rm -f /usr/local/sbin/legion-yara-update /usr/local/sbin/legion-yara-scan"
 undo "integrity check removed (AIDE and package checks)" bash -c "$(declare -f unit_off); unit_off legion-integrity.timer legion-integrity.service; rm -f /usr/local/sbin/legion-aide-baseline /usr/local/sbin/legion-integrity-check /etc/apt/apt.conf.d/99legion-aide; rm -rf /etc/legion"

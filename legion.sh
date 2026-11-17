@@ -204,8 +204,8 @@ banner() {
   # The Ubuntu logo sits left of the lettering when there is color, UTF-8 and
   # room (80 columns); otherwise the lettering is shown alone.
   local cols logo=0 n
-  cols="$({ stty size </dev/tty; } 2>/dev/null | awk '{ print $2 }')"
-  [ "${cols:-0}" -gt 0 ] 2>/dev/null || cols="$(tput cols 2>/dev/null)"
+  cols="$({ stty size </dev/tty; } 2>/dev/null | awk '{ print $2 }' || true)"
+  [ "${cols:-0}" -gt 0 ] 2>/dev/null || cols="$(tput cols 2>/dev/null || true)"
   [ "${cols:-0}" -gt 0 ] 2>/dev/null || cols="${COLUMNS:-80}"
   if [ "$UTF8" = 1 ] && [ -n "$C_RST" ] && [ "${cols:-0}" -ge 80 ]; then logo=1; logo_lines; fi
   # Tagline and framework tags go under the lettering.
@@ -706,6 +706,20 @@ EOF
     [ ! -d "$d" ] || chmod 700 "$d"
   done
   [ ! -d /etc/sudoers.d ] || chmod 750 /etc/sudoers.d
+  # A mail server only needs to accept mail from this device (CIS: mail
+  # transfer agent in local-only mode). Local mail, such as cron reports,
+  # keeps working. The old setting is kept for legion-remove.sh.
+  if command -v postconf >/dev/null 2>&1; then
+    local mta
+    mta="$(postconf -h inet_interfaces 2>/dev/null)"
+    if [ -n "$mta" ] && [ "$mta" != loopback-only ]; then
+      install -d -m 700 "$STATE/backup"
+      [ -f "$STATE/backup/postfix-inet_interfaces" ] || printf '%s\n' "$mta" >"$STATE/backup/postfix-inet_interfaces"
+      postconf -e 'inet_interfaces = loopback-only'
+      systemctl restart postfix 2>/dev/null || true
+      info "mail server (Postfix) now accepts connections from this device only"
+    fi
+  fi
 }
 
 step_yara() {
@@ -1150,7 +1164,8 @@ c_audit_rules() {
   local r k
   r="$(auditctl -l 2>/dev/null)"
   for k in identity privilege time modules; do
-    grep -q "key=$k" <<<"$r" || { NOTE="audit rules for '$k' not loaded"; return 1; }
+    # auditctl -l shows file watches as "-k NAME" and syscall rules as "key=NAME".
+    grep -qE -- "(-k |key=)$k( |$)" <<<"$r" || { NOTE="audit rules for '$k' not loaded"; return 1; }
   done
 }
 c_log_retention() {
@@ -1226,10 +1241,16 @@ c_ssh() {
   NOTE="SSH allows root or password logins"; return 1
 }
 c_listeners() {
+  # Lists each non-loopback TCP listener as port(program), e.g. 25(master).
   local l
-  l="$(ss -ltnH 2>/dev/null | awk '$4 !~ /^(127\.|\[::1\]|\[::ffff:127\.)/ && $4 !~ /%lo:/ { print $4 }' | sort -u | tr '\n' ' ')"
+  l="$(ss -ltnpH 2>/dev/null | awk '$4 !~ /^(127\.|\[::1\]|\[::ffff:127\.)/ && $4 !~ /%lo:/ {
+      port = $4; sub(/.*:/, "", port)
+      prog = $0; if (match(prog, /\(\("[^"]+"/)) prog = substr(prog, RSTART + 3, RLENGTH - 4); else prog = "?"
+      print port "(" prog ")" }' | sort -u | tr '\n' ' ')"
   [ -z "$l" ] && return 0
-  NOTE="reachable TCP ports: ${l% } (ports published by Docker bypass the firewall)"; return 1
+  NOTE="services reachable from the network: ${l% }"
+  case "$l" in *docker-proxy*) NOTE="$NOTE. Ports published by Docker bypass the firewall" ;; esac
+  return 1
 }
 c_kernel() {
   in_container && return 2
