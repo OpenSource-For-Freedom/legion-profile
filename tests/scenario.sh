@@ -50,6 +50,16 @@ echo "# tamper" >>/root/.bashrc; systemctl start legion-integrity.service 2>/dev
 t "editing /root/.bashrc trips the integrity check" test "$(systemctl show -p Result --value legion-integrity.service)" != success
 t "a failed scan fails its compliance check" bash -c "LEGION_NO_ANIM=1 bash /root/legion.sh --report-only 2>&1 | grep -q '✖ Daily file integrity check'"
 sed -i '$ d' /root/.bashrc; /usr/local/sbin/legion-aide-baseline test >/dev/null 2>&1; systemctl reset-failed legion-integrity.service
+echo "=== integrity: package updates accepted, other changes kept for review"
+echo planted >/etc/legion-planted; sleep 2
+DEBIAN_FRONTEND=noninteractive apt-get install -y -q tree >/dev/null 2>&1
+t "apt run kept the earlier, unrelated change for review" grep -qx /etc/legion-planted /var/lib/legion/aide/pending
+t "files apt itself changed were not flagged" bash -c "! grep -q '^/etc/ld.so\\|tree' /var/lib/legion/aide/pending"
+systemctl start legion-integrity.service 2>/dev/null
+t "daily check fails while the change is unreviewed" test "$(systemctl show -p Result --value legion-integrity.service)" != success
+rm -f /etc/legion-planted; /usr/local/sbin/legion-aide-baseline manual; systemctl reset-failed legion-integrity.service
+systemctl start legion-integrity.service
+t "accepting with 'manual' clears it" test "$(systemctl show -p Result --value legion-integrity.service)" = success
 t "lockout: correct password works" auth login Correct-Horse-9x
 for i in 1 2 3 4 5; do auth login wrong-$i; done
 t "lockout: 5 failures lock the account" bash -c "! echo Correct-Horse-9x | pamtester login kit authenticate acct_mgmt"

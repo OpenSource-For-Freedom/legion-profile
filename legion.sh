@@ -306,6 +306,7 @@ done
 READONLY=0
 [ "$CHECK" = 0 ] && [ "$REPORT_ONLY" = 0 ] || READONLY=1
 LEGION_VERSION="2026.11"
+LEGION_START="$(date +%s)"
 [ "$BANNER_SHOWN" = 1 ] || [ "$DRIFT_ONLY" = 1 ] || banner
 
 # Legion installs a copy of itself for the daily check, so it must run from a
@@ -340,11 +341,13 @@ elif ! flock -n 9; then
   fail "Legion is already running"; exit 2
 fi
 RUNLOG="$LOGDIR/run-$(date +%Y%m%d-%H%M%S)-$$.log"
+# Lets the AIDE apt hook tell Legion's own changes from others during this run.
+[ "$READONLY" = 1 ] || echo "$LEGION_START" >/run/legion-run-start
 find "$LOGDIR" -maxdepth 1 -name 'run-*.log' -printf '%T@ %p\n' 2>/dev/null | sort -rn | awk 'NR > 60 { print $2 }' | xargs -r rm -f
 : >"$RUNLOG"
 chmod 640 "$RUNLOG"
 FLAGS="$(mktemp -d)" # steps run in subshells and leave notes for the summary here
-trap 'rm -rf "$FLAGS"' EXIT
+trap 'rm -rf "$FLAGS"; [ "$READONLY" = 1 ] || rm -f /run/legion-run-start' EXIT
 
 SELF_PATH="$(readlink -f "$0")"
 osr() { sed -n "s/^$1=//p" /etc/os-release | tr -d '"'; }
@@ -1133,25 +1136,57 @@ Legion = p+u+g+s+ftype+sha512+acl+xattrs
 EOF
   cat >/usr/local/sbin/legion-aide-baseline <<'EOF'
 #!/usr/bin/env bash
-# Records the current state as the AIDE baseline. Called by the installer and
-# after every apt run; logs what changed since the previous baseline.
+# Records the current state as the AIDE baseline and logs what changed.
+#   legion-aide-baseline apt                after a package operation (apt hook)
+#   legion-aide-baseline "legion run" TIME  at the end of a Legion run
+#   legion-aide-baseline manual             you reviewed the changes: accept all
+# For apt and Legion runs, only changes made during that operation (file
+# change time at or after its start) are accepted silently. Anything changed
+# earlier was not made by it, so it goes on the pending list, and the daily
+# check fails until someone reviews it and runs: legion-aide-baseline manual
 set -uo pipefail
 umask 027
 export LC_ALL=C.UTF-8
 CONF=/etc/legion/aide.conf
 DB=/var/lib/legion/aide/aide.db
+PENDING=/var/lib/legion/aide/pending
 LOG=/var/log/legion/integrity.log
-why="${1:-manual}"
-if [ -f "$DB" ]; then
-  out="$(aide --config="$CONF" --update 2>&1)"
-  rc=$?
-  [ "$rc" -lt 14 ] || { echo "$out" >&2; exit 2; }
-  if [ "$rc" != 0 ]; then
-    { echo "== $(date -u +%FT%TZ) baseline refreshed ($why); these changes were accepted:"; echo "$out"; } >>"$LOG"
-  fi
-else
+why="${1:-manual}" since="${2:-}"
+if [ "$why" = apt ]; then
+  since="$(cat /run/legion-apt-start 2>/dev/null || echo $(($(date +%s) - 900)))"
+  rm -f /run/legion-apt-start
+  # During a Legion run, Legion's own earlier changes count as made by it.
+  r="$(cat /run/legion-run-start 2>/dev/null || true)"
+  [ -z "$r" ] || [ "$r" -ge "$since" ] || since="$r"
+fi
+if [ ! -f "$DB" ]; then
   out="$(aide --config="$CONF" --init 2>&1)" || { echo "$out" >&2; exit 2; }
   echo "== $(date -u +%FT%TZ) baseline created ($why)" >>"$LOG"
+  mv -f "$DB.new" "$DB"
+  exit 0
+fi
+if [ "$why" = manual ]; then
+  rm -f "$PENDING"
+elif [ -n "$since" ]; then
+  # Changed, added or removed paths since the last baseline.
+  aide --config="$CONF" --check 2>/dev/null | sed -nE 's/^[a-z?!][^:]*: (\/.*)$/\1/p' | sort -u |
+    while read -r p; do
+      if [ -e "$p" ] || [ -L "$p" ]; then t="$(stat -c %Z "$p" 2>/dev/null || echo 0)"
+      else t="$(stat -c %Z "$(dirname "$p")" 2>/dev/null || echo 0)"; fi
+      [ "$t" -ge "$since" ] || echo "$p"
+    done >>"$PENDING.new"
+  if [ -s "$PENDING.new" ]; then
+    { [ ! -f "$PENDING" ] || cat "$PENDING"; cat "$PENDING.new"; } | sort -u >"$PENDING.tmp"
+    mv -f "$PENDING.tmp" "$PENDING"
+    { echo "== $(date -u +%FT%TZ) changes not made by this $why, kept for review:"; cat "$PENDING.new"; } >>"$LOG"
+  fi
+  rm -f "$PENDING.new"
+fi
+out="$(aide --config="$CONF" --update 2>&1)"
+rc=$?
+[ "$rc" -lt 14 ] || { echo "$out" >&2; exit 2; }
+if [ "$rc" != 0 ]; then
+  { echo "== $(date -u +%FT%TZ) baseline refreshed ($why); these changes were accepted:"; echo "$out"; } >>"$LOG"
 fi
 mv -f "$DB.new" "$DB"
 EOF
@@ -1178,11 +1213,19 @@ aide_rc=$?
 [ -z "$pkg" ] || { echo "$pkg"; status=1; }
 if [ "$aide_rc" -ge 14 ]; then echo "$aide_out" >&2; exit 2; fi
 [ "$aide_rc" = 0 ] || { echo "$aide_out"; status=1; }
+# Changes found when a package operation or Legion run refreshed the baseline,
+# but not made by it: they stay reported until reviewed.
+if [ -s /var/lib/legion/aide/pending ]; then
+  { echo "changes not made by a package update, not yet reviewed:"; cat /var/lib/legion/aide/pending
+    echo "review them, then accept with: sudo legion-aide-baseline manual"; } | tee -a "$LOG"
+  status=1
+fi
 exit "$status"
 EOF
   chmod 750 /usr/local/sbin/legion-aide-baseline /usr/local/sbin/legion-integrity-check
   # Refresh the AIDE baseline after every package change, logging the changes.
   cat >/etc/apt/apt.conf.d/99legion-aide <<'EOF'
+DPkg::Pre-Invoke { "[ -e /run/legion-apt-start ] || date +%s >/run/legion-apt-start || true"; };
 DPkg::Post-Invoke { "if [ -x /usr/local/sbin/legion-aide-baseline ] && [ -f /var/lib/legion/aide/aide.db ]; then /usr/local/sbin/legion-aide-baseline apt || true; fi"; };
 EOF
   cat >/etc/systemd/system/legion-integrity.service <<'EOF'
@@ -1205,7 +1248,7 @@ Persistent=true
 WantedBy=timers.target
 EOF
   systemctl daemon-reload
-  /usr/local/sbin/legion-aide-baseline install
+  /usr/local/sbin/legion-aide-baseline install "$LEGION_START"
   systemctl enable --now legion-integrity.timer
   info "AIDE baseline recorded"
 }
@@ -1403,7 +1446,7 @@ if [ "$READONLY" = 0 ]; then
   # Legion's own later steps change files AIDE watches; accept them (logged in
   # integrity.log) so the next daily check does not report them.
   if [ -x /usr/local/sbin/legion-aide-baseline ] && [ -f "$STATE/aide/aide.db" ]; then
-    /usr/local/sbin/legion-aide-baseline "legion run" >/dev/null 2>&1 || warn "could not refresh the AIDE baseline"
+    /usr/local/sbin/legion-aide-baseline "legion run" "$LEGION_START" >/dev/null 2>&1 || warn "could not refresh the AIDE baseline"
   fi
 fi
 

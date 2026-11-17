@@ -59,6 +59,8 @@ Run `bash legion.sh --help` for all options. It is safe to run again.
 
 A ClamAV, YARA, integrity or daily compliance finding marks its service as failed. Check with `systemctl --failed`.
 
+Package updates are accepted into the integrity baseline automatically. Any other change to watched files stays reported in `/var/log/legion/integrity.log` until you review it and accept it with `sudo legion-aide-baseline manual`.
+
 ## If you get locked out
 
 Wait 30 minutes, or have another admin run `sudo faillock --user NAME --reset`.
