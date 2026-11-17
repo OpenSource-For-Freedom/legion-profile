@@ -101,9 +101,14 @@ LOGO_PX=(
 )
 
 # Turns LOGO_PX into 13 colored lines of half-block characters in LOGO_LINES.
+# With "console", uses the Linux console's 16 colors: brown (its closest color
+# to Ubuntu orange) and light gray, with foreground and background shades that
+# match, so the disc looks even.
 logo_lines() {
   local fo fw bo bw r c t b top bot line z=$'\e[0m'
-  if [[ "${COLORTERM:-}" == *truecolor* || "${COLORTERM:-}" == *24bit* ]]; then
+  if [ "${1:-}" = console ]; then
+    fo=$'\e[33m' fw=$'\e[37m' bo=$'\e[43m' bw=$'\e[47m'
+  elif [[ "${COLORTERM:-}" == *truecolor* || "${COLORTERM:-}" == *24bit* ]]; then
     fo=$'\e[38;2;233;84;32m' fw=$'\e[38;2;255;255;255m' bo=$'\e[48;2;233;84;32m' bw=$'\e[48;2;255;255;255m'
   else
     fo=$'\e[38;5;202m' fw=$'\e[38;5;231m' bo=$'\e[48;5;202m' bw=$'\e[48;5;231m'
@@ -129,17 +134,44 @@ logo_lines() {
   done
 }
 
+LEGION_ART=(
+  "██╗     ███████╗ ██████╗ ██╗ ██████╗ ███╗   ██╗"
+  "██║     ██╔════╝██╔════╝ ██║██╔═══██╗████╗  ██║"
+  "██║     █████╗  ██║  ███╗██║██║   ██║██╔██╗ ██║"
+  "██║     ██╔══╝  ██║   ██║██║██║   ██║██║╚██╗██║"
+  "███████╗███████╗╚██████╔╝██║╚██████╔╝██║ ╚████║"
+  "╚══════╝╚══════╝ ╚═════╝ ╚═╝ ╚═════╝ ╚═╝  ╚═══╝"
+)
+LEGION_TAGS=("SOC 2" "HIPAA" "FedRAMP" "NIST 800-171" "CMMC L2")
+
+# Prints the console login banner for /etc/issue: the Ubuntu logo, LEGION,
+# the tags and the warning text in $1. The lettering keeps its 256-color
+# gradient, which the Linux console maps to cyan and blue. The text has no
+# backslashes, so agetty prints it as is.
+issue_banner() {
+  local i n t tag="" z=$'\e[0m' dim=$'\e[2m' cyan=$'\e[36m' grad=(51 45 39 33 27 21)
+  logo_lines console
+  for t in "${LEGION_TAGS[@]}"; do tag+="${tag:+ $dim·$z }$cyan$t$z"; done
+  echo
+  for i in "${!LOGO_LINES[@]}"; do
+    n=$((i - 2))
+    if [ "$n" -ge 0 ] && [ "$n" -lt "${#LEGION_ART[@]}" ]; then
+      printf '  %s   \e[38;5;%sm%s%s\n' "${LOGO_LINES[i]}" "${grad[n]}" "${LEGION_ART[n]}" "$z"
+    elif [ "$i" = 9 ]; then
+      printf '  %s   %sP R O F I L E   ·   endpoint hardening%s\n' "${LOGO_LINES[i]}" "$dim" "$z"
+    elif [ "$i" = 10 ]; then
+      printf '  %s   %s\n' "${LOGO_LINES[i]}" "$tag"
+    else
+      printf '  %s\n' "${LOGO_LINES[i]}"
+    fi
+  done
+  printf '\n  \e[1m%s%s\n\n' "$1" "$z"
+}
+
 banner() {
   local lines i grad=(51 45 39 33 27 21)
   if [ "$UTF8" = 1 ]; then
-    lines=(
-      "██╗     ███████╗ ██████╗ ██╗ ██████╗ ███╗   ██╗"
-      "██║     ██╔════╝██╔════╝ ██║██╔═══██╗████╗  ██║"
-      "██║     █████╗  ██║  ███╗██║██║   ██║██╔██╗ ██║"
-      "██║     ██╔══╝  ██║   ██║██║██║   ██║██║╚██╗██║"
-      "███████╗███████╗╚██████╔╝██║╚██████╔╝██║ ╚████║"
-      "╚══════╝╚══════╝ ╚═════╝ ╚═╝ ╚═════╝ ╚═╝  ╚═══╝"
-    )
+    lines=("${LEGION_ART[@]}")
   else
     lines=("L E G I O N")
   fi
@@ -152,7 +184,7 @@ banner() {
   [ "${cols:-0}" -gt 0 ] 2>/dev/null || cols="${COLUMNS:-80}"
   if [ "$UTF8" = 1 ] && [ -n "$C_RST" ] && [ "${cols:-0}" -ge 80 ]; then logo=1; logo_lines; fi
   # Tagline and framework tags go under the lettering.
-  local tag t sub tags=("SOC 2" "HIPAA" "FedRAMP" "NIST 800-171" "CMMC L2")
+  local tag t sub tags=("${LEGION_TAGS[@]}")
   sub="${C_DIM}P R O F I L E   ·   endpoint hardening${C_RST}"
   tag=""
   for t in "${tags[@]}"; do tag+="${tag:+ ${C_DIM}·${C_RST} }${C_INFO}${t}${C_RST}"; done
@@ -893,8 +925,11 @@ step_login() {
     [ -e "$STATE/backup/${f##*/}" ] || [ -e "$STATE/backup/${f##*/}.absent" ] ||
       cp -p "$f" "$STATE/backup/${f##*/}" 2>/dev/null || : >"$STATE/backup/${f##*/}.absent"
   done
-  printf '%s\n\n' "$text" >/etc/issue
-  printf '%s\n' "$text" >/etc/issue.net
+  # Console login: the full Legion banner with the Ubuntu logo. SSH login
+  # (issue.net, shown only if sshd's Banner points at it): the lettering and
+  # text without color, since SSH clients show it unprocessed.
+  issue_banner "$text" >/etc/issue
+  { echo; printf '  %s\n' "${LEGION_ART[@]}"; printf '\n  %s\n\n' "$text"; } >/etc/issue.net
   info "login banner set for the console and remote logins"
   if [ ! -f /usr/share/glib-2.0/schemas/org.gnome.desktop.screensaver.gschema.xml ] || ! command -v dconf >/dev/null; then
     info "no GNOME desktop found; login screen banner and screen lock skipped"
