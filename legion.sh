@@ -101,14 +101,9 @@ LOGO_PX=(
 )
 
 # Turns LOGO_PX into 13 colored lines of half-block characters in LOGO_LINES.
-# With "console", uses the Linux console's 16 colors: brown (its closest color
-# to Ubuntu orange) and light gray, with foreground and background shades that
-# match, so the disc looks even.
 logo_lines() {
   local fo fw bo bw r c t b top bot line z=$'\e[0m'
-  if [ "${1:-}" = console ]; then
-    fo=$'\e[33m' fw=$'\e[37m' bo=$'\e[43m' bw=$'\e[47m'
-  elif [[ "${COLORTERM:-}" == *truecolor* || "${COLORTERM:-}" == *24bit* ]]; then
+  if [[ "${COLORTERM:-}" == *truecolor* || "${COLORTERM:-}" == *24bit* ]]; then
     fo=$'\e[38;2;233;84;32m' fw=$'\e[38;2;255;255;255m' bo=$'\e[48;2;233;84;32m' bw=$'\e[48;2;255;255;255m'
   else
     fo=$'\e[38;5;202m' fw=$'\e[38;5;231m' bo=$'\e[48;5;202m' bw=$'\e[48;5;231m'
@@ -144,25 +139,55 @@ LEGION_ART=(
 )
 LEGION_TAGS=("SOC 2" "HIPAA" "FedRAMP" "NIST 800-171" "CMMC L2")
 
+# The Ubuntu logo for the Linux console, 15 x 15 pixels: . empty, o orange,
+# w white. Console fonts often lack half-block characters, so each pixel is
+# drawn as two spaces with a background color, which needs no special glyph.
+LOGO_CON_PX=(
+  .....ooooo.....
+  ...ooooooooo...
+  ..ooooooowwoo..
+  .oooooooowwooo.
+  .ooooowwoooooo.
+  ooooowwwooooooo
+  owwoowooowwoooo
+  owwwooooowwoooo
+  owwoowooowwoooo
+  ooooowwwooooooo
+  .ooooowwoooooo.
+  .oooooooowwooo.
+  ..ooooooowwoo..
+  ...ooooooooo...
+  .....ooooo.....
+)
+
 # Prints the console login banner for /etc/issue: the Ubuntu logo, LEGION,
-# the tags and the warning text in $1. The lettering keeps its 256-color
-# gradient, which the Linux console maps to cyan and blue. The text has no
-# backslashes, so agetty prints it as is.
+# the tags and the warning text in $1. Colors are the console's own 16:
+# brown (its closest color to Ubuntu orange) and light gray. The LEGION
+# gradient is 256-color, which the console maps to cyan and blue. The text has
+# no backslashes, so agetty prints it as is. 80 columns wide.
 issue_banner() {
-  local i n t tag="" z=$'\e[0m' dim=$'\e[2m' cyan=$'\e[36m' grad=(51 45 39 33 27 21)
-  logo_lines console
+  local i n t c row px tag="" z=$'\e[0m' dim=$'\e[2m' cyan=$'\e[36m' grad=(51 45 39 33 27 21)
   for t in "${LEGION_TAGS[@]}"; do tag+="${tag:+ $dim·$z }$cyan$t$z"; done
   echo
-  for i in "${!LOGO_LINES[@]}"; do
-    n=$((i - 2))
+  for i in "${!LOGO_CON_PX[@]}"; do
+    row="${LOGO_CON_PX[i]}" px=""
+    for ((c = 0; c < ${#row}; c++)); do
+      case "${row:c:1}" in
+        o) px+=$'\e[43m  ' ;;
+        w) px+=$'\e[47m  ' ;;
+        *) px+="$z  " ;;
+      esac
+    done
+    px+="$z"
+    n=$((i - 3)) # centers lettering, tagline and tags on the 15 logo rows
     if [ "$n" -ge 0 ] && [ "$n" -lt "${#LEGION_ART[@]}" ]; then
-      printf '  %s   \e[38;5;%sm%s%s\n' "${LOGO_LINES[i]}" "${grad[n]}" "${LEGION_ART[n]}" "$z"
-    elif [ "$i" = 9 ]; then
-      printf '  %s   %sP R O F I L E   ·   endpoint hardening%s\n' "${LOGO_LINES[i]}" "$dim" "$z"
+      printf '%s  \e[38;5;%sm%s%s\n' "$px" "${grad[n]}" "${LEGION_ART[n]}" "$z"
     elif [ "$i" = 10 ]; then
-      printf '  %s   %s\n' "${LOGO_LINES[i]}" "$tag"
+      printf '%s  %sP R O F I L E   ·   endpoint hardening%s\n' "$px" "$dim" "$z"
+    elif [ "$i" = 11 ]; then
+      printf '%s  %s\n' "$px" "$tag"
     else
-      printf '  %s\n' "${LOGO_LINES[i]}"
+      printf '%s\n' "$px"
     fi
   done
   printf '\n  \e[1m%s%s\n\n' "$1" "$z"
