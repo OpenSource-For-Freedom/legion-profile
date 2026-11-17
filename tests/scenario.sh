@@ -11,7 +11,7 @@ ip link add virbr0 type bridge 2>/dev/null && ip link set virbr0 up
 ufw --force reset >/dev/null; ufw allow 2222/tcp comment "user rule" >/dev/null
 ufw allow from 172.17.0.0/16 to any port 5353 proto udp comment "my mdns" >/dev/null; ufw --force enable >/dev/null
 ufw show added >/tmp/ufw.before
-md5sum /etc/pam.d/common-* /etc/issue /etc/issue.net >/tmp/files.before
+md5sum /etc/pam.d/common-* /etc/issue /etc/issue.net /etc/gdm3/greeter.dconf-defaults >/tmp/files.before
 REMOVES_BEFORE=$(grep -c '^Remove:' /var/log/apt/history.log)
 echo "=== refuses to run from a pipe"
 out="$(bash -s -- --check </root/legion.sh 2>&1)"; rc=$?
@@ -44,6 +44,7 @@ t "audit watches the real sudo and kmod" bash -c "grep -q \"^-w $(readlink -f /u
 t "cron.yearly locked" test "$(stat -c %a /etc/cron.yearly)" = 700
 t "IPv6 off keeps loopback" grep -qx "net.ipv6.conf.lo.disable_ipv6 = 0" /etc/sysctl.d/60-legion-ipv6.conf
 t "integrity check clean right after install" bash -c "systemctl start legion-integrity.service; [ \"\$(systemctl show -p Result --value legion-integrity.service)\" = success ]"
+t "graphical login banner compiled into GDM's settings" bash -c "printf 'file-db:/tmp/greeter-db\n' >/tmp/greeter-profile && dconf compile /tmp/greeter-db /usr/share/gdm/dconf && [ \"\$(DCONF_PROFILE=/tmp/greeter-profile dconf read /org/gnome/login-screen/banner-message-enable)\" = true ]"
 t "no failed units" bash -c "[ -z \"\$(systemctl --failed --no-legend --plain | grep -v polkit)\" ]"
 t "root shell history does not trip the integrity check" bash -c "echo ls >>/root/.bash_history; echo x >/root/.lesshst; systemctl start legion-integrity.service; [ \"\$(systemctl show -p Result --value legion-integrity.service)\" = success ]"
 echo "# tamper" >>/root/.bashrc; systemctl start legion-integrity.service 2>/dev/null

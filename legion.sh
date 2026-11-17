@@ -1310,23 +1310,38 @@ step_login() {
     return 0
   fi
   install -d -m 755 /etc/dconf/profile /etc/dconf/db/local.d/locks /etc/dconf/db/gdm.d
-  # Login screen banner. GDM reads the "gdm" dconf profile; the /etc copy is
-  # Ubuntu's own profile with Legion's system database added.
-  if [ -f /usr/share/dconf/profile/gdm ] && { [ ! -f /etc/dconf/profile/gdm ] || [ -f "$STATE/backup/created-dconf-profile-gdm" ]; }; then
-    awk '{ print } /^user-db:user$/ { print "system-db:gdm" }' /usr/share/dconf/profile/gdm >/etc/dconf/profile/gdm
-    : >"$STATE/backup/created-dconf-profile-gdm"
+  # Login screen banner. On Ubuntu, GDM builds its login-screen settings at
+  # every start from /usr/share/gdm/dconf, which links to
+  # /etc/gdm3/greeter.dconf-defaults: the supported place for a banner. (GDM 50
+  # no longer reads the "gdm" dconf profile that earlier Legion versions used;
+  # those leftover files are removed here.)
+  if [ -f "$STATE/backup/created-dconf-profile-gdm" ]; then
+    rm -f /etc/dconf/profile/gdm "$STATE/backup/created-dconf-profile-gdm"
   fi
-  if [ ! -f /etc/dconf/profile/gdm ] && [ ! -f /usr/share/dconf/profile/gdm ]; then
-    info "no GDM login screen found; graphical login banner skipped"
-  elif grep -qx 'system-db:gdm' /etc/dconf/profile/gdm 2>/dev/null; then
-    cat >/etc/dconf/db/gdm.d/01-legion-banner <<EOF
-[org/gnome/login-screen]
-banner-message-enable=true
-banner-message-text='$text'
-EOF
+  rm -f /etc/dconf/db/gdm.d/01-legion-banner
+  local g=/etc/gdm3/greeter.dconf-defaults
+  if [ -f "$g" ]; then
+    backup_once "$g" gdm3-greeter.dconf-defaults
+    awk -v text="$text" '
+      /^#? *banner-message-(enable|text)=/ && insec { next }
+      /^\[/ { insec = ($0 == "[org/gnome/login-screen]") }
+      { print }
+      insec && $0 == "[org/gnome/login-screen]" {
+        print "banner-message-enable=true"
+        print "banner-message-text=\x27" text "\x27"
+        done = 1
+      }
+      END {
+        if (!done) {
+          print ""; print "[org/gnome/login-screen]"
+          print "banner-message-enable=true"; print "banner-message-text=\x27" text "\x27"
+        }
+      }' "$g" >"$g.legion" && cat "$g.legion" >"$g" && rm -f "$g.legion"
+    # Rebuild GDM's settings now, so the next login screen shows the banner.
+    [ ! -x /usr/share/gdm/generate-config ] || /usr/share/gdm/generate-config || true
     info "login screen banner set"
   else
-    warn "custom GDM settings profile found; login screen banner not set"
+    info "no GDM login screen found; graphical login banner skipped"
   fi
   # Screen lock after 10 minutes idle, locked immediately, and users cannot
   # turn it off (dconf locks). 10 minutes meets CIS, DISA STIG and CMMC.
@@ -1578,9 +1593,8 @@ c_banner() {
     NOTE="no login banner on the console"; return 1
   fi
   # On a GNOME desktop the graphical login screen is the one people see.
-  if [ -f /usr/share/dconf/profile/gdm ] && command -v dconf >/dev/null; then
-    if ! grep -qx 'banner-message-enable=true' /etc/dconf/db/gdm.d/01-legion-banner 2>/dev/null ||
-      ! grep -qx 'system-db:gdm' /etc/dconf/profile/gdm 2>/dev/null; then
+  if [ -f /etc/gdm3/greeter.dconf-defaults ]; then
+    if ! awk '/^\[/ { s = ($0 == "[org/gnome/login-screen]") } s && /^banner-message-enable=true$/ { f = 1 } END { exit !f }' /etc/gdm3/greeter.dconf-defaults; then
       NOTE="no banner on the graphical login screen"; return 1
     fi
   fi

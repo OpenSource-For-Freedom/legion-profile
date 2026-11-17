@@ -129,6 +129,10 @@ if [ -f /etc/dconf/db/gdm.d/01-legion-banner ] || [ -f /etc/dconf/db/local.d/00-
     [ ! -f "$1/created-dconf-profile-user" ] || rm -f /etc/dconf/profile/user
     dconf update' _ "$B"
 fi
+if [ -f "$B/gdm3-greeter.dconf-defaults" ]; then
+  # shellcheck disable=SC2016 # expanded by the inner shell
+  undo "login screen settings restored" bash -c 'cp -p "$1" /etc/gdm3/greeter.dconf-defaults && { [ ! -x /usr/share/gdm/generate-config ] || /usr/share/gdm/generate-config || true; }' _ "$B/gdm3-greeter.dconf-defaults"
+fi
 if [ -f "$B/postfix-inet_interfaces" ] && command -v postconf >/dev/null; then
   # shellcheck disable=SC2016 # expanded by the inner shell
   undo "mail server network setting restored" bash -c 'postconf -e "inet_interfaces = $(cat "$1")" && { systemctl restart postfix 2>/dev/null || true; }' _ "$B/postfix-inet_interfaces"
