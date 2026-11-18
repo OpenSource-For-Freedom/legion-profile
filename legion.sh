@@ -1319,27 +1319,39 @@ step_login() {
     rm -f /etc/dconf/profile/gdm "$STATE/backup/created-dconf-profile-gdm"
   fi
   rm -f /etc/dconf/db/gdm.d/01-legion-banner
-  local g=/etc/gdm3/greeter.dconf-defaults
+  local g=/etc/gdm3/greeter.dconf-defaults logo="" asset
+  # The LEGION logo image for the login screen ships next to legion.sh.
+  asset="$(dirname "$SELF_PATH")/assets/legion-login-logo.png"
+  if [ -f "$g" ] && [ -f "$asset" ]; then
+    install -d -m 755 /usr/local/share/legion
+    install -m 644 "$asset" /usr/local/share/legion/login-logo.png
+    logo=/usr/local/share/legion/login-logo.png
+  elif [ -f "$g" ] && [ -f /usr/local/share/legion/login-logo.png ]; then
+    logo=/usr/local/share/legion/login-logo.png # installed copy, kept on re-runs
+  fi
   if [ -f "$g" ]; then
     backup_once "$g" gdm3-greeter.dconf-defaults
-    awk -v text="$text" '
+    awk -v text="$text" -v logo="$logo" '
       /^#? *banner-message-(enable|text)=/ && insec { next }
+      /^logo=/ && insec { next }
       /^\[/ { insec = ($0 == "[org/gnome/login-screen]") }
       { print }
       insec && $0 == "[org/gnome/login-screen]" {
         print "banner-message-enable=true"
         print "banner-message-text=\x27" text "\x27"
+        if (logo != "") print "logo=\x27" logo "\x27"
         done = 1
       }
       END {
         if (!done) {
           print ""; print "[org/gnome/login-screen]"
           print "banner-message-enable=true"; print "banner-message-text=\x27" text "\x27"
+          if (logo != "") print "logo=\x27" logo "\x27"
         }
       }' "$g" >"$g.legion" && cat "$g.legion" >"$g" && rm -f "$g.legion"
     # Rebuild GDM's settings now, so the next login screen shows the banner.
     [ ! -x /usr/share/gdm/generate-config ] || /usr/share/gdm/generate-config || true
-    info "login screen banner set"
+    if [ -n "$logo" ]; then info "login screen banner and LEGION logo set"; else info "login screen banner set (logo image not found next to legion.sh)"; fi
   else
     info "no GDM login screen found; graphical login banner skipped"
   fi

@@ -24,6 +24,8 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 for f in legion.sh legion-remove.sh tests/scenario.sh; do docker cp "$f" "$name:/root/"; done
+docker exec "$name" mkdir -p /root/assets
+docker cp assets/legion-login-logo.png "$name:/root/assets/"
 out="$(docker exec "$name" bash /root/scenario.sh)"
 echo "$out"
 grep -q 'RESULT: .* 0 failed' <<<"$out"

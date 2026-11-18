@@ -45,6 +45,8 @@ t "cron.yearly locked" test "$(stat -c %a /etc/cron.yearly)" = 700
 t "IPv6 off keeps loopback" grep -qx "net.ipv6.conf.lo.disable_ipv6 = 0" /etc/sysctl.d/60-legion-ipv6.conf
 t "integrity check clean right after install" bash -c "systemctl start legion-integrity.service; [ \"\$(systemctl show -p Result --value legion-integrity.service)\" = success ]"
 t "graphical login banner compiled into GDM's settings" bash -c "printf 'file-db:/tmp/greeter-db\n' >/tmp/greeter-profile && dconf compile /tmp/greeter-db /usr/share/gdm/dconf && [ \"\$(DCONF_PROFILE=/tmp/greeter-profile dconf read /org/gnome/login-screen/banner-message-enable)\" = true ]"
+t "LEGION logo set for the login screen" bash -c "[ \"\$(DCONF_PROFILE=/tmp/greeter-profile dconf read /org/gnome/login-screen/logo)\" = \"'/usr/local/share/legion/login-logo.png'\" ]"
+t "logo readable by the temporary login-screen user" bash -c "setpriv --reuid 60578 --regid 60578 --clear-groups head -c 8 /usr/local/share/legion/login-logo.png | grep -q PNG"
 t "no failed units" bash -c "[ -z \"\$(systemctl --failed --no-legend --plain | grep -v polkit)\" ]"
 t "root shell history does not trip the integrity check" bash -c "echo ls >>/root/.bash_history; echo x >/root/.lesshst; systemctl start legion-integrity.service; [ \"\$(systemctl show -p Result --value legion-integrity.service)\" = success ]"
 echo "# tamper" >>/root/.bashrc; systemctl start legion-integrity.service 2>/dev/null
@@ -100,6 +102,7 @@ t "firewall rules exactly as before" diff /tmp/ufw.before <(ufw show added)
 t "PAM files and banners byte-identical to before" md5sum -c --quiet /tmp/files.before
 t "lockout gone" bash -c "for i in 1 2 3 4 5 6; do echo w | pamtester login kit authenticate acct_mgmt; done; echo Correct-Horse-9x | pamtester login kit authenticate acct_mgmt"
 t "IPv6 file removed" test ! -e /etc/sysctl.d/60-legion-ipv6.conf
+t "logo image removed" test ! -e /usr/local/share/legion
 t "cron.yearly back to 755" test "$(stat -c %a /etc/cron.yearly)" = 755
 t "no failed units after removal" bash -c "[ -z \"\$(systemctl --failed --no-legend --plain | grep -v polkit)\" ]"
 t "second removal is clean" bash -c "bash /root/legion-remove.sh --yes"
