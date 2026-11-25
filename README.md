@@ -14,13 +14,16 @@ CIS and DISA STIG have not published benchmarks for Ubuntu 26.04 yet. Until they
 - Updates: installs all pending updates and turns on daily automatic security updates
 - Firewall: blocks incoming connections, allows outgoing
 - Account lockout: 5 failed logins lock an account for 30 minutes, then it unlocks by itself
-- Login banner, and a screen lock after 10 minutes that users cannot turn off
-- Password policy: new passwords need 12+ characters and 3 character types
-- Audit logging: records changes to accounts, sudo, system time, kernel modules and the firewall
+- Login banner, and a screen lock after 10 minutes that users cannot turn off. The login screen asks for the user name instead of listing users
+- Passwords: 12+ characters and 3 character types, the last 24 cannot be reused, and they expire every 90 days. An account is disabled 45 days after its password expires
+- Sessions: idle console and SSH sessions end after 15 minutes, new files are private to their owner (umask 027), sudo asks for the password again after 15 minutes, and only root can use su
+- Audit logging: the CIS set of audit rules. Changes to accounts, sudo and settings, logins, refused file access, permission changes, deletions, mounts, kernel modules and every use of a privileged program. You get an alert when the audit log disk runs low
 - Log retention: keeps system logs for 1 year
 - Malware scanning: ClamAV weekly, plus YARA weekly with the YARA Forge core rules
+- Vulnerability scanning: weekly, with Ubuntu's own security notices (OVAL) and OpenSCAP
 - File integrity: daily check of installed package files and of /etc, /boot, /usr/local and /root
-- System hardening: safer kernel settings, unused network protocols blocked, tighter cron and sudoers permissions
+- System hardening: safer kernel settings, unused network protocols and filesystems blocked, no core dumps, USB drives and discs never start programs, SSH server hardened (if installed), tighter cron, sudoers and account file permissions
+- File and account review (report only): world-writable files, files without an owner, setuid programs that no package installed, duplicate IDs, open home folders, system accounts with a login shell
 - Daily compliance check: flags any check that starts failing
 
 ## Before you run it
@@ -73,7 +76,15 @@ Every change is tested in an Ubuntu 26.04 container with systemd:
 bash tests/run.sh
 ```
 
-It installs Legion, checks the firewall, lockout, integrity and scan results, runs Legion again, removes it and confirms the system is back to how it was. Containers cannot load audit rules or kernel settings, so those need a real machine or VM.
+It installs Legion, checks the firewall, lockout, passwords, sessions, integrity and scan results, runs Legion again, removes it and confirms the system is back to how it was.
+
+Containers cannot load audit rules or kernel settings, so a second test runs Legion in a real Ubuntu 26.04 virtual machine (QEMU, inside Docker), reboots it, checks again and removes Legion:
+
+```bash
+bash tests/vm/run.sh
+```
+
+It needs Docker and hardware virtualization (/dev/kvm), and downloads the Ubuntu cloud image once.
 
 ## How to remove it
 
@@ -90,4 +101,8 @@ It keeps installed updates, Ubuntu Pro and your logs. Add `--remove-packages`, `
 - No script makes an organization compliant. These frameworks also cover policies, training, backups and vendor agreements. The report lists what Legion cannot check.
 - FIPS-validated cryptography, required for FedRAMP and CMMC, is not yet available for Ubuntu 26.04. Legion reports it and picks it up once Ubuntu Pro offers it.
 - Docker bypasses the firewall for published container ports.
+- Passwords expire every 90 days. On the first run, a password that is already older than 76 days gets 14 more days, so nobody is forced to change it in the middle of a session.
+- Files you create are no longer readable by other users. Commands run with sudo keep Ubuntu's usual permissions, so software installed with sudo still works for everyone.
+- Some filesystems are blocked: hfs and hfsplus (Mac drives), udf (DVDs and some USB drives), cramfs, freevxfs and jffs2. USB drives formatted as FAT, exFAT or NTFS work as usual.
+- sudo-rs, Ubuntu 26.04's sudo, has no separate log file. sudo use is recorded in the system journal and by the audit rules.
 - Earlier versions of Legion installed the Postfix mail server as a side effect of installing AIDE. Legion now sets Postfix to accept connections from this device only. If nothing on your machine sends mail, you can remove it: `sudo apt purge postfix bsd-mailx`.

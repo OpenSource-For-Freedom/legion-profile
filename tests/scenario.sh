@@ -11,7 +11,11 @@ ip link add virbr0 type bridge 2>/dev/null && ip link set virbr0 up
 ufw --force reset >/dev/null; ufw allow 2222/tcp comment "user rule" >/dev/null
 ufw allow from 172.17.0.0/16 to any port 5353 proto udp comment "my mdns" >/dev/null; ufw --force enable >/dev/null
 ufw show added >/tmp/ufw.before
-md5sum /etc/pam.d/common-* /etc/issue /etc/issue.net /etc/gdm3/greeter.dconf-defaults >/tmp/files.before
+md5sum /etc/pam.d/common-* /etc/pam.d/su /etc/issue /etc/issue.net /etc/gdm3/greeter.dconf-defaults \
+  /etc/login.defs /etc/default/useradd /etc/audit/auditd.conf 2>/dev/null >/tmp/files.before
+# kit's password is 200 days old: Legion must give 14 days, not expire it now.
+chage -d "$(date -d '200 days ago' +%F)" kit
+grep '^kit:' /etc/shadow >/tmp/kit.shadow.before
 REMOVES_BEFORE=$(grep -c '^Remove:' /var/log/apt/history.log)
 echo "=== refuses to run from a pipe"
 out="$(bash -s -- --check </root/legion.sh 2>&1)"; rc=$?
@@ -47,7 +51,33 @@ t "integrity check clean right after install" bash -c "systemctl start legion-in
 t "graphical login banner compiled into GDM's settings" bash -c "printf 'file-db:/tmp/greeter-db\n' >/tmp/greeter-profile && dconf compile /tmp/greeter-db /usr/share/gdm/dconf && [ \"\$(DCONF_PROFILE=/tmp/greeter-profile dconf read /org/gnome/login-screen/banner-message-enable)\" = true ]"
 t "LEGION logo set for the login screen" bash -c "[ \"\$(DCONF_PROFILE=/tmp/greeter-profile dconf read /org/gnome/login-screen/logo)\" = \"'/usr/local/share/legion/login-logo.png'\" ]"
 t "logo readable by the temporary login-screen user" bash -c "setpriv --reuid 60578 --regid 60578 --clear-groups head -c 8 /usr/local/share/legion/login-logo.png | grep -q PNG"
-t "no failed units" bash -c "[ -z \"\$(systemctl --failed --no-legend --plain | grep -v polkit)\" ]"
+echo "=== Phase 1: CIS / 800-171 additions"
+day=$(( $(date +%s) / 86400 ))
+t "kit's password age: 90 days max, 1 min, 7 warn, 45 inactive" bash -c "grep -q '^kit:[^:]*:[0-9]*:1:90:7:45:' /etc/shadow"
+t "old password given 14 days, not expired on the spot" bash -c "[ \"\$(grep '^kit:' /etc/shadow | cut -d: -f3)\" = $((day - 76)) ]"
+t "new accounts: 90-day passwords, disabled after 45 days" bash -c "grep -qP '^PASS_MAX_DAYS\t90$' /etc/login.defs && grep -qx INACTIVE=45 /etc/default/useradd"
+t "kit can still log in (password not expired)" auth login Correct-Horse-9x
+# shellcheck disable=SC2016 # expanded by the inner shells
+t "idle shell timeout for console and SSH, not graphical terminals" bash -c 'su - kit -c "echo \$TMOUT" | grep -qx 900 && [ -z "$(env -i DISPLAY=:0 PATH=/usr/bin:/bin bash -lc "echo \${TMOUT:-}")" ]'
+t "login umask hides new files from other users" bash -c "su - kit -c umask | grep -qE '^0(0|2)07$'"
+t "sudo still works, and keeps umask 022 for root" bash -c "[ \"\$(su - kit -c 'sudo -n sh -c umask')\" = 0022 ]"
+t "sudo settings in place and valid" bash -c "visudo -c -q && grep -qx 'Defaults use_pty' /etc/sudoers.d/legion"
+t "su refused for normal users" bash -c "! su - kit -c 'echo x | su -c true root' 2>/dev/null"
+t "root can still su" bash -c "su - kit -c true"
+t "core dumps off, apport off" bash -c "grep -q 'hard core 0' /etc/security/limits.d/legion.conf && grep -qx Storage=none /etc/systemd/coredump.conf.d/legion.conf"
+t "unused filesystems blocked" grep -q 'install hfsplus /bin/false' /etc/modprobe.d/legion-filesystems.conf
+t "SSH hardened and still running" bash -c "sshd -T | grep -qx 'maxauthtries 4' && sshd -T | grep -qx 'x11forwarding no' && systemctl is-active -q ssh"
+t "login screen hides user names" bash -c "dconf compile /tmp/greeter-db2 /usr/share/gdm/dconf && printf 'file-db:/tmp/greeter-db2\n' >/tmp/greeter-profile2 && [ \"\$(DCONF_PROFILE=/tmp/greeter-profile2 dconf read /org/gnome/login-screen/disable-user-list)\" = true ]"
+t "media autorun off and locked" bash -c "grep -qx autorun-never=true /etc/dconf/db/local.d/00-legion-media && grep -q autorun-never /etc/dconf/db/local.d/locks/00-legion-media"
+t "CIS audit rules generated (privileged programs, access, delete)" bash -c "grep -c -- '-k privileged' /etc/audit/rules.d/legion.rules | awk '\$1 > 5 { ok = 1 } END { exit !ok }' && grep -q 'exit=-EACCES' /etc/audit/rules.d/legion.rules && grep -q -- '-k delete' /etc/audit/rules.d/legion.rules"
+t "audit rules only use system calls the machine has" bash -c "! grep -E -- '-S [^ ]*(chown32|stime)' /etc/audit/rules.d/legion.rules | grep -q 'arch=b64'"
+t "auditd alerts when its disk runs low" grep -qx 'space_left_action = exec /usr/local/sbin/legion-audit-alert' /etc/audit/auditd.conf
+for _ in $(seq 1 120); do systemctl is-active -q legion-vuln-scan.service || break; sleep 5; done
+echo "vulnerability scan: $(cat /var/lib/legion/oval/last 2>/dev/null || echo 'no result') $(systemctl show -p Result --value legion-vuln-scan.service)"
+t "vulnerability scan ran and wrote its report" bash -c "test -s /var/log/legion/vuln-report.html && test -f /var/lib/legion/oval/last"
+t "report lists the new checks" bash -c "LEGION_NO_ANIM=1 bash /root/legion.sh --report-only >/tmp/rep.log 2>&1; grep -q 'Last 24 passwords cannot be reused' /tmp/rep.log && grep -q 'Setuid programs all come from packages' /tmp/rep.log"
+grep -E '✖' /tmp/rep.log | sed 's/^/      report: /'
+t "no failed units" bash -c "[ -z \"\$(systemctl --failed --no-legend --plain | grep -v polkit | grep -v legion-vuln-scan)\" ]"
 t "root shell history does not trip the integrity check" bash -c "echo ls >>/root/.bash_history; echo x >/root/.lesshst; systemctl start legion-integrity.service; [ \"\$(systemctl show -p Result --value legion-integrity.service)\" = success ]"
 echo "# tamper" >>/root/.bashrc; systemctl start legion-integrity.service 2>/dev/null
 t "editing /root/.bashrc trips the integrity check" test "$(systemctl show -p Result --value legion-integrity.service)" != success
@@ -63,6 +93,11 @@ t "daily check fails while the change is unreviewed" test "$(systemctl show -p R
 rm -f /etc/legion-planted; /usr/local/sbin/legion-aide-baseline manual; systemctl reset-failed legion-integrity.service
 systemctl start legion-integrity.service
 t "accepting with 'manual' clears it" test "$(systemctl show -p Result --value legion-integrity.service)" = success
+echo "=== password history"
+cp -p /etc/shadow /tmp/shadow.keep
+t "password change works" bash -c "echo kit:Second-Pass-77x | chpasswd"
+t "reusing a recent password is refused" bash -c "! echo kit:Correct-Horse-9x | chpasswd"
+cp -p /tmp/shadow.keep /etc/shadow; /usr/local/sbin/legion-aide-baseline manual >/dev/null 2>&1
 t "lockout: correct password works" auth login Correct-Horse-9x
 for i in 1 2 3 4 5; do auth login wrong-$i; done
 t "lockout: 5 failures lock the account" bash -c "! echo Correct-Horse-9x | pamtester login kit authenticate acct_mgmt"
@@ -101,6 +136,11 @@ t "firewall still on, as before Legion" bash -c "ufw status | grep -q 'Status: a
 t "firewall rules exactly as before" diff /tmp/ufw.before <(ufw show added)
 t "PAM files and banners byte-identical to before" md5sum -c --quiet /tmp/files.before
 t "lockout gone" bash -c "for i in 1 2 3 4 5 6; do echo w | pamtester login kit authenticate acct_mgmt; done; echo Correct-Horse-9x | pamtester login kit authenticate acct_mgmt"
+t "kit's password age back to before (except the change date)" bash -c "[ \"\$(grep '^kit:' /etc/shadow | cut -d: -f4-7)\" = \"\$(cut -d: -f4-7 /tmp/kit.shadow.before)\" ]"
+t "sudo, SSH, session, core dump, filesystem files removed" bash -c "! ls /etc/sudoers.d/legion /etc/ssh/sshd_config.d/00-legion.conf /etc/profile.d/legion-session.sh /etc/security/limits.d/legion.conf /etc/modprobe.d/legion-filesystems.conf /usr/share/pam-configs/legion-pwhistory /etc/security/opasswd 2>/dev/null"
+t "group legion-su deleted, su works as before" bash -c "! getent group legion-su"
+t "vulnerability scan removed" test ! -e /etc/systemd/system/legion-vuln-scan.timer
+t "SSH server still running after removal" systemctl is-active -q ssh
 t "IPv6 file removed" test ! -e /etc/sysctl.d/60-legion-ipv6.conf
 t "logo image removed" test ! -e /usr/local/share/legion
 t "cron.yearly back to 755" test "$(stat -c %a /etc/cron.yearly)" = 755

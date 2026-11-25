@@ -112,6 +112,41 @@ if [ -f /usr/share/pam-configs/legion-faillock ] || [ -f /usr/share/pam-configs/
         sed -i -E "/^legion-faillock(-notify)?$/d" /var/lib/pam/seen'
   fi
 fi
+if [ -f /usr/share/pam-configs/legion-pwhistory ]; then
+  pam-auth-update --disable legion-pwhistory >/dev/null 2>&1 || true
+  if grep -qE '^[^#]*pam_pwhistory.so remember=24' /etc/pam.d/common-password; then
+    fail "password history still active: /etc/pam.d/common-password has local edits"
+    info "to finish, run: sudo pam-auth-update --force --disable legion-pwhistory, then this script again"
+    FAILED=$((FAILED + 1))
+  else
+    undo "password history removed" bash -c '
+      rm -f /usr/share/pam-configs/legion-pwhistory && sed -i -E "/^legion-pwhistory$/d" /var/lib/pam/seen'
+  fi
+fi
+# The old password hashes it kept are deleted with it, if Legion created the file.
+[ ! -f "$B/created-opasswd" ] || [ -f /usr/share/pam-configs/legion-pwhistory ] || undo "saved old passwords deleted" rm -f /etc/security/opasswd
+if [ -f "$B/chage" ]; then
+  # Each account's password age settings as they were; the date of the last
+  # password change is left alone, since the user may have changed it since.
+  # shellcheck disable=SC2016 # expanded by the inner shell
+  undo "password age settings of each account restored" bash -c '
+    while IFS=: read -r u _ min max warn inact; do
+      id "$u" >/dev/null 2>&1 || continue
+      chage -m "${min:--1}" -M "${max:--1}" -W "${warn:--1}" -I "${inact:--1}" "$u"
+    done <"$1"' _ "$B/chage"
+fi
+for f in login.defs:/etc/login.defs useradd:/etc/default/useradd pam.d-su:/etc/pam.d/su apport:/etc/default/apport; do
+  if [ -f "$B/${f%%:*}" ]; then undo "${f#*:} restored" cp -p "$B/${f%%:*}" "${f#*:}"; fi
+done
+if [ -f "$B/created-group-legion-su" ] && getent group legion-su >/dev/null; then undo "group legion-su deleted" groupdel legion-su; fi
+if [ -f /etc/sudoers.d/legion ]; then undo "sudo settings removed" rm -f /etc/sudoers.d/legion; fi
+undo "idle session timeout and core dump settings removed" rm -f /etc/profile.d/legion-session.sh /etc/security/limits.d/legion.conf /etc/systemd/coredump.conf.d/legion.conf
+if [ -f "$B/apport-state" ] && [ "$(cat "$B/apport-state")" = enabled ]; then
+  undo "crash reporter (apport) turned back on" systemctl enable --now apport.service
+fi
+if [ -f /etc/ssh/sshd_config.d/00-legion.conf ]; then
+  undo "SSH server settings removed" bash -c 'rm -f /etc/ssh/sshd_config.d/00-legion.conf && { systemctl try-reload-or-restart ssh.service 2>/dev/null || true; }'
+fi
 if [ -e "$B/issue" ] || [ -e "$B/issue.absent" ] || [ -e "$B/issue.net" ] || [ -e "$B/issue.net.absent" ]; then
   # shellcheck disable=SC2016 # expanded by the inner shell
   undo "login banner restored" bash -c '
@@ -119,12 +154,13 @@ if [ -e "$B/issue" ] || [ -e "$B/issue.absent" ] || [ -e "$B/issue.net" ] || [ -
       if [ -f "$1/$f" ]; then cp -p "$1/$f" "/etc/$f"; elif [ -f "$1/$f.absent" ]; then rm -f "/etc/$f"; fi
     done' _ "$B"
 fi
-if [ -f /etc/dconf/db/gdm.d/01-legion-banner ] || [ -f /etc/dconf/db/local.d/00-legion-screenlock ]; then
+if [ -f /etc/dconf/db/gdm.d/01-legion-banner ] || [ -f /etc/dconf/db/local.d/00-legion-screenlock ] || [ -f /etc/dconf/db/local.d/00-legion-media ]; then
   # Empty settings folders are left in place on purpose: dconf update then
   # rebuilds them as empty databases, so no Legion lock survives.
   # shellcheck disable=SC2016 # expanded by the inner shell
-  undo "login screen banner and enforced screen lock removed" bash -c '
-    rm -f /etc/dconf/db/gdm.d/01-legion-banner /etc/dconf/db/local.d/00-legion-screenlock /etc/dconf/db/local.d/locks/00-legion-screenlock
+  undo "login screen banner, enforced screen lock and media autorun setting removed" bash -c '
+    rm -f /etc/dconf/db/gdm.d/01-legion-banner /etc/dconf/db/local.d/00-legion-screenlock /etc/dconf/db/local.d/locks/00-legion-screenlock \
+      /etc/dconf/db/local.d/00-legion-media /etc/dconf/db/local.d/locks/00-legion-media
     [ ! -f "$1/created-dconf-profile-gdm" ] || rm -f /etc/dconf/profile/gdm
     [ ! -f "$1/created-dconf-profile-user" ] || rm -f /etc/dconf/profile/user
     dconf update' _ "$B"
@@ -154,6 +190,7 @@ undo "Ubuntu's own daily AIDE timer restored" bash -c '
   elif [ -f /var/lib/aide/aide.db ]; then
     systemctl enable --now dailyaidecheck.timer
   fi' _ "$B" "$REMOVE_PACKAGES"
+undo "weekly vulnerability scan removed" bash -c "$(declare -f unit_off); unit_off legion-vuln-scan.timer legion-vuln-scan.service; rm -f /usr/local/sbin/legion-vuln-scan"
 undo "ClamAV weekly scan removed" bash -c "$(declare -f unit_off); unit_off clamscan-home.timer clamscan-home.service"
 undo "daily compliance check, the legion command and its images removed" bash -c "$(declare -f unit_off); unit_off legion-check.timer legion-check.service; rm -f /usr/local/sbin/legion; rm -rf /usr/local/share/legion"
 undo "Legion state removed (/var/lib/legion)" rm -rf /var/lib/legion
@@ -192,7 +229,7 @@ if [ -e "$B/20auto-upgrades" ]; then
 elif [ -e "$B/20auto-upgrades.absent" ]; then
   undo "automatic update settings restored" rm -f /etc/apt/apt.conf.d/20auto-upgrades
 fi
-undo "audit rules removed" rm -f /etc/audit/rules.d/legion.rules /etc/audit/rules.d/soc2.rules
+undo "audit rules removed" rm -f /etc/audit/rules.d/legion.rules /etc/audit/rules.d/soc2.rules /usr/local/sbin/legion-audit-alert
 if [ -f "$B/auditd.conf" ]; then
   undo "audit settings restored" cp -p "$B/auditd.conf" /etc/audit/auditd.conf
 elif [ -f /etc/audit/auditd.conf ]; then
@@ -226,7 +263,7 @@ if ! in_container; then
         { systemctl try-restart apport.service 2>/dev/null || true; }'
   fi
 fi
-undo "network protocol blocks removed" rm -f /etc/modprobe.d/legion-uncommon-net.conf /etc/modprobe.d/soc2-uncommon-net.conf
+undo "network protocol and filesystem blocks removed" rm -f /etc/modprobe.d/legion-uncommon-net.conf /etc/modprobe.d/soc2-uncommon-net.conf /etc/modprobe.d/legion-filesystems.conf
 # shellcheck disable=SC2016 # expanded by the inner shell
 undo "cron and sudoers permissions back to Ubuntu defaults" bash -c '
   [ ! -f /etc/crontab ] || chmod 644 /etc/crontab

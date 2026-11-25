@@ -580,6 +580,16 @@ backup_once() { # file [name]
   [ -e "$b" ] || [ -e "$b.absent" ] || { if [ -e "$1" ]; then cp -p "$1" "$b"; else : >"$b.absent"; fi; }
 }
 
+# Sets KEY VALUE in a login.defs-style file: replaces the active line, or
+# adds one. Commented lines are left alone.
+set_def() { # key value file
+  if grep -qE "^$1[[:space:]]" "$3"; then
+    sed -i -E "s|^$1[[:space:]].*|$1\t$2|" "$3"
+  else
+    printf '%s\t%s\n' "$1" "$2" >>"$3"
+  fi
+}
+
 # Adds a firewall rule labelled for Legion, unless the same rule already
 # exists (with any label). An existing rule belongs to the user and is left
 # alone, so legion-remove.sh never deletes it.
@@ -655,7 +665,7 @@ add_signed_repo() {
 }
 
 STEP=0
-TOTAL=$((11 + WITH_PRO + YARA + AIDE + LOCKOUT + TOOLS))
+TOTAL=$((12 + WITH_PRO + YARA + AIDE + LOCKOUT + TOOLS))
 RESULTS=()
 FAILED=0
 
@@ -800,63 +810,160 @@ step_firewall() {
   ufw --force enable
 }
 
+# One audit rule per architecture for the given system calls, keeping only
+# the calls that architecture has (a name auditctl does not know would stop
+# the whole rule file from loading).
+audit_syscalls() { # "extra filters" key syscall...
+  local filters="$1" key="$2" arch s list
+  shift 2
+  for arch in b64 b32; do
+    if [ "$arch" = b32 ] && [ "$ARCH" != x86_64 ]; then continue; fi
+    list=""
+    for s in "$@"; do
+      if ausyscall "$arch" "$s" --exact >/dev/null 2>&1; then list+="${list:+,}$s"; fi
+    done
+    if [ -n "$list" ]; then echo "-a always,exit -F arch=$arch -S $list${filters:+ $filters} -k $key"; fi
+  done
+}
+# File and folder watches, for the paths that exist on this machine.
+audit_watch() { # key path...
+  local key="$1" f
+  shift
+  for f in "$@"; do
+    if [ -e "$f" ]; then echo "-w $f -p wa -k $key"; fi
+  done
+}
+# Run-watches go on the real program, not a link to it: on Ubuntu 26.04
+# /usr/bin/sudo links to sudo-rs and modprobe/insmod link to kmod, and a
+# watch on a link never fires.
+audit_exec() { # rule-template key program...
+  local tpl="$1" key="$2" prog real seen=" "
+  shift 2
+  for prog in "$@"; do
+    real="$(readlink -f "$prog" 2>/dev/null || true)"
+    if [ -x "$real" ] && [[ "$seen" != *" $real "* ]]; then
+      seen+="$real "
+      # shellcheck disable=SC2059 # the template is a fixed format
+      printf -- "${tpl}\n" "$real" "$key"
+    fi
+  done
+}
+# Programs that run with raised privileges (setuid or setgid), on the local
+# disks. Containers and snaps are skipped: their programs are not this
+# system's.
+# The local disk filesystems to search: / and any other local disk mounted
+# as a folder (a separate /home, for example).
+local_disks() {
+  local m
+  mounts=(/)
+  while read -r m; do
+    if [ -d "$m" ] && [ "$m" != / ]; then mounts+=("$m"); fi
+  done < <(findmnt -rno TARGET -t ext2,ext3,ext4,xfs,btrfs,f2fs,zfs 2>/dev/null || true)
+}
+privileged_programs() {
+  local mounts=()
+  local_disks
+  find "${mounts[@]}" -xdev \( -path /proc -o -path /sys -o -path /var/lib/docker -o -path /var/lib/containers -o -path /snap -o -path /var/snap \) -prune \
+    -o -type f \( -perm -4000 -o -perm -2000 \) -print 2>/dev/null | sort -u
+}
+
 step_audit() {
   apt-get "${APT[@]}" install auditd audispd-plugins
   backup_once /etc/audit/auditd.conf
-  local b32=""
-  # 32-bit system call rules only apply on x86_64.
-  if [ "$ARCH" = x86_64 ]; then
-    b32="-a always,exit -F arch=b32 -S adjtimex,settimeofday,clock_settime,stime -k time
--a always,exit -F arch=b32 -S init_module,finit_module,delete_module -k modules"
-  fi
-  # Exec watches go on the real program, not a link to it: on Ubuntu 26.04
-  # /usr/bin/sudo links to sudo-rs and modprobe/insmod link to kmod, and a
-  # watch on a link never fires.
-  local prog real priv="" mods="" seen=" "
-  for prog in /usr/bin/sudo /usr/bin/su; do
-    real="$(readlink -f "$prog" 2>/dev/null || true)"
-    [ -x "$real" ] && [[ "$seen" != *" $real "* ]] || continue
-    seen+="$real " priv+="-w $real -p x -k privilege"$'\n'
-  done
-  for prog in /usr/sbin/insmod /usr/sbin/modprobe /usr/sbin/rmmod /sbin/insmod /sbin/modprobe; do
-    real="$(readlink -f "$prog" 2>/dev/null || true)"
-    [ -x "$real" ] && [[ "$seen" != *" $real "* ]] || continue
-    seen+="$real " mods+="-w $real -p x -k modules"$'\n'
-  done
-  cat >/etc/audit/rules.d/legion.rules <<EOF
-# Identity and privilege changes
--w /etc/passwd -p wa -k identity
--w /etc/group -p wa -k identity
--w /etc/shadow -p wa -k identity
--w /etc/gshadow -p wa -k identity
--w /etc/sudoers -p wa -k privilege
--w /etc/sudoers.d/ -p wa -k privilege
-# Authentication and session records
--w /var/log/auth.log -p wa -k auth
--w /run/faillock/ -p wa -k auth
--w /var/log/lastlog -p wa -k logins
-# Privilege escalation
-${priv%$'\n'}
-# Time changes and kernel modules
--a always,exit -F arch=b64 -S adjtimex,settimeofday,clock_settime -k time
--a always,exit -F arch=b64 -S init_module,finit_module,delete_module -k modules
-$b32
--w /etc/localtime -p wa -k time
-${mods%$'\n'}
-# Firewall and audit config itself
--w /etc/ufw/ -p wa -k firewall
--w /etc/audit/ -p wa -k audit-config
+  local real users="-F auid>=1000 -F auid!=unset"
+  {
+    echo "# Legion Profile audit rules (CIS Ubuntu 24.04 section 6.3.3; NIST 800-53"
+    echo "# AU-2, AU-12; 800-171 3.3.1, 3.3.2). Rules about what people do apply"
+    echo "# to real users only (login ID 1000 and up), so system services do not"
+    echo "# flood the log. Generated by Legion; changes here are overwritten."
+    echo "## Accounts, groups, passwords and login settings"
+    audit_watch identity /etc/passwd /etc/group /etc/shadow /etc/gshadow /etc/security/opasswd \
+      /etc/nsswitch.conf /etc/pam.conf /etc/pam.d /etc/login.defs /etc/security/pwquality.conf.d
+    echo "## Administrator rights"
+    audit_watch privilege /etc/sudoers /etc/sudoers.d
+    audit_exec '-w %s -p x -k %s' privilege /usr/bin/sudo /usr/bin/su
+    audit_syscalls "-C euid!=uid -F auid!=unset" user_emulation execve
+    echo "## Sessions and logins"
+    audit_watch session /var/run/utmp /var/log/wtmp /var/log/btmp
+    audit_watch logins /var/log/lastlog /run/faillock /var/log/auth.log
+    echo "## Network settings and host name"
+    audit_syscalls "" system-locale sethostname setdomainname
+    audit_watch system-locale /etc/issue /etc/issue.net /etc/hosts /etc/hostname /etc/networks \
+      /etc/network /etc/netplan /etc/NetworkManager/system-connections
+    echo "## Time"
+    audit_syscalls "" time adjtimex settimeofday clock_settime stime
+    audit_watch time /etc/localtime
+    echo "## Kernel modules"
+    audit_syscalls "" modules init_module finit_module delete_module create_module query_module
+    audit_exec '-w %s -p x -k %s' modules /usr/sbin/insmod /usr/sbin/modprobe /usr/sbin/rmmod /sbin/insmod /sbin/modprobe
+    echo "## Permission and ownership changes"
+    audit_syscalls "$users" perm_mod chmod fchmod fchmodat fchmodat2
+    audit_syscalls "$users" perm_mod chown fchown lchown fchownat chown32 fchown32 lchown32
+    audit_syscalls "$users" perm_mod setxattr lsetxattr fsetxattr removexattr lremovexattr fremovexattr
+    echo "## File access refused"
+    audit_syscalls "-F exit=-EACCES $users" access creat open openat openat2 truncate ftruncate truncate64 ftruncate64
+    audit_syscalls "-F exit=-EPERM $users" access creat open openat openat2 truncate ftruncate truncate64 ftruncate64
+    echo "## Mounts"
+    audit_syscalls "$users" mounts mount umount umount2
+    echo "## File deletion and renaming"
+    audit_syscalls "$users" delete unlink unlinkat rename renameat renameat2
+    echo "## AppArmor policy"
+    audit_watch MAC-policy /etc/apparmor /etc/apparmor.d
+    echo "## Commands that change permissions or accounts"
+    audit_exec "-a always,exit -F path=%s -F perm=x $users -k %s" perm_chng /usr/bin/chcon /usr/bin/setfacl /usr/bin/chacl
+    audit_exec "-a always,exit -F path=%s -F perm=x $users -k %s" usermod /usr/sbin/usermod
+    echo "## Programs that run with raised privileges (setuid and setgid)"
+    while read -r real; do
+      echo "-a always,exit -F path=$real -F perm=x $users -k privileged"
+    done < <(privileged_programs)
+    echo "## Firewall and audit settings"
+    audit_watch firewall /etc/ufw
+    audit_watch audit-config /etc/audit /etc/libaudit.conf
+  } >/etc/audit/rules.d/legion.rules.new
+  chmod 640 /etc/audit/rules.d/legion.rules.new
+  mv -f /etc/audit/rules.d/legion.rules.new /etc/audit/rules.d/legion.rules
+  # Logs rotate and never fill the disk: 20 files of 32 MB. When the disk
+  # runs low anyway, an alert goes to the system log and to logged-in users
+  # (800-171 3.3.4) and auditd keeps recording.
+  cat >/usr/local/sbin/legion-audit-alert <<'EOF'
+#!/bin/sh
+# Legion Profile: auditd runs this when the audit log disk runs low.
+logger -p auth.crit -t legion "audit log disk space is low; audit records stop when the disk is full"
+date -u +%Y-%m-%dT%H:%M:%SZ >/var/lib/legion/audit-space-low
+wall "Legion: the audit log disk is running out of space. Free up disk space." 2>/dev/null || true
 EOF
-  # Rotate, never fill the disk: 20 files of max_log_file MB each are kept.
-  sed -i -E 's/^#?\s*max_log_file_action\s*=.*/max_log_file_action = ROTATE/' /etc/audit/auditd.conf
-  sed -i -E 's/^#?\s*num_logs\s*=.*/num_logs = 20/' /etc/audit/auditd.conf
+  chmod 750 /usr/local/sbin/legion-audit-alert
+  local conf=/etc/audit/auditd.conf k v kv
+  cp -p "$conf" "$conf.legion-prev"
+  for kv in "max_log_file=32" "num_logs=20" "max_log_file_action=ROTATE" \
+    "space_left_action=exec /usr/local/sbin/legion-audit-alert" \
+    "admin_space_left_action=exec /usr/local/sbin/legion-audit-alert"; do
+    k="${kv%%=*}" v="${kv#*=}"
+    if grep -qE "^#?[[:space:]]*${k}[[:space:]]*=" "$conf"; then
+      sed -i -E "s|^#?[[:space:]]*${k}[[:space:]]*=.*|$k = $v|" "$conf"
+    else
+      echo "$k = $v" >>"$conf"
+    fi
+  done
   if [ "$IN_CONTAINER" = 1 ]; then
+    rm -f "$conf.legion-prev"
     systemctl enable auditd # the kernel audit system belongs to the host
-  else
-    augenrules --load
-    systemctl enable --now auditd
-    info "$(auditctl -l | grep -c .) audit rules loaded"
+    return 0
   fi
+  systemctl enable auditd
+  systemctl restart auditd 2>/dev/null || systemctl reload auditd 2>/dev/null || true
+  sleep 1
+  if ! systemctl is-active -q auditd; then
+    cp -p "$conf.legion-prev" "$conf"
+    systemctl restart auditd || true
+    warn "auditd did not start with the new settings; its previous settings are back"
+  fi
+  rm -f "$conf.legion-prev"
+  if ! augenrules --load; then
+    warn "some audit rules did not load; see: sudo augenrules --check"
+    return 1
+  fi
+  info "$(auditctl -l | grep -c .) audit rules loaded"
 }
 
 step_logs() {
@@ -907,24 +1014,206 @@ maxrepeat = 3
 dictcheck = 1
 enforce_for_root
 EOF
+  # Password history: the last 24 passwords cannot be reused (800-171
+  # 3.5.8). Added through pam-auth-update, like the lockout.
+  local rc=0
+  cat >/usr/share/pam-configs/legion-pwhistory <<'EOF'
+Name: Legion Profile: refuse the last 24 passwords
+Default: yes
+Priority: 512
+Password-Type: Primary
+Password:
+	requisite	pam_pwhistory.so remember=24 enforce_for_root use_authtok
+Password-Initial:
+	requisite	pam_pwhistory.so remember=24 enforce_for_root
+EOF
+  [ -e /etc/security/opasswd ] || { install -m 600 /dev/null /etc/security/opasswd; : >"$STATE/backup/created-opasswd"; }
+  pam-auth-update --enable legion-pwhistory
+  if ! grep -q 'pam_pwhistory.so remember=24' /etc/pam.d/common-password; then
+    pam-auth-update --disable legion-pwhistory || true
+    rm -f /usr/share/pam-configs/legion-pwhistory
+    warn "the password (PAM) files have local edits, so password history was not added"
+    rc=1
+  fi
+  # Password age: changed at least every 90 days, at most once a day, with a
+  # warning 7 days ahead. An account whose password expired 45 days ago is
+  # disabled (800-171 3.5.6). New accounts get this from login.defs and
+  # useradd; existing ones through chage. Their old values are kept for
+  # legion-remove.sh.
+  backup_once /etc/login.defs
+  backup_once /etc/default/useradd
+  set_def PASS_MAX_DAYS 90 /etc/login.defs
+  set_def PASS_MIN_DAYS 1 /etc/login.defs
+  set_def PASS_WARN_AGE 7 /etc/login.defs
+  if grep -qE '^INACTIVE=' /etc/default/useradd; then
+    sed -i -E 's/^INACTIVE=.*/INACTIVE=45/' /etc/default/useradd
+  else
+    echo INACTIVE=45 >>/etc/default/useradd
+  fi
+  # An existing password older than 76 days gets 14 more days, so nobody is
+  # forced to change it in the middle of a session (sudo may refuse an
+  # expired password until the next login).
+  local today u last uid n=0 grace=0 accounts=()
+  today=$(($(date +%s) / 86400))
+  mapfile -t accounts < <(awk -F: '$2 !~ /^[!*]/ && $2 != "" { print $1 ":" $3 ":" $4 ":" $5 ":" $6 ":" $7 }' /etc/shadow)
+  for u in "${accounts[@]}"; do
+    IFS=: read -r u last _ <<<"$u"
+    uid="$(id -u "$u" 2>/dev/null)" || continue
+    [ "$uid" -ge 1000 ] && [ "$uid" -lt 60000 ] || continue
+    grep -q "^${u}:" "$STATE/backup/chage" 2>/dev/null || grep "^${u}:" /etc/shadow | cut -d: -f1,3-7 >>"$STATE/backup/chage"
+    if [ -n "$last" ] && [ "$last" -gt 0 ] && [ $((today - last)) -gt 76 ]; then
+      chage -d "$(date -u -d "@$(((today - 76) * 86400))" +%F)" "$u"
+      grace=$((grace + 1))
+    fi
+    chage -m 1 -M 90 -W 7 -I 45 "$u"
+    n=$((n + 1))
+  done
+  info "$n accounts: passwords now expire every 90 days"
+  [ "$grace" = 0 ] || info "$grace of them had a password older than 76 days and must change it within 14 days"
+  return "$rc"
+}
+
+step_session() {
+  # Idle text sessions (console, SSH) end after 15 minutes; graphical
+  # sessions are covered by the screen lock (800-171 3.1.11).
+  cat >/etc/profile.d/legion-session.sh <<'EOF'
+# Legion Profile: idle console and SSH shells end after 15 minutes.
+# Graphical sessions are covered by the screen lock instead.
+if [ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && [ "${TMOUT:-}" != 900 ]; then
+  TMOUT=900
+  readonly TMOUT
+  export TMOUT
+fi
+EOF
+  chmod 644 /etc/profile.d/legion-session.sh
+  # New files are not readable by other users (umask 027, applied at login
+  # by pam_umask). Commands run with sudo keep Ubuntu's usual umask, so
+  # files installed as root stay readable, as before.
+  backup_once /etc/login.defs
+  set_def UMASK 027 /etc/login.defs
+  # sudo: its own terminal for each command, the password again after 15
+  # minutes, 3 tries. The file is checked before it is installed; a broken
+  # sudoers file would lock everyone out of sudo.
+  local tmp
+  tmp="$(mktemp)"
+  cat >"$tmp" <<'EOF'
+# Legion Profile: sudo settings (CIS 5.2). Commands run in their own
+# terminal, the password is asked again after 15 minutes, 3 tries are
+# allowed, and commands keep Ubuntu's usual umask (022) whatever the user's
+# own umask is.
+Defaults use_pty
+Defaults timestamp_timeout=15
+Defaults passwd_tries=3
+Defaults umask=0022
+Defaults umask_override
+EOF
+  chmod 440 "$tmp"
+  if visudo -c -q -f "$tmp" >/dev/null 2>&1; then
+    install -m 440 -o root -g root "$tmp" /etc/sudoers.d/legion
+    if ! visudo -c -q >/dev/null 2>&1; then
+      rm -f /etc/sudoers.d/legion
+      warn "sudo settings not added: the sudo configuration did not check out with them"
+    fi
+  else
+    warn "sudo settings not added: this sudo does not accept them"
+  fi
+  rm -f "$tmp"
+  # su is limited to members of an empty group, so only root can use it;
+  # people use sudo instead (CIS 5.2.7). root itself is not affected.
+  if [ -f /etc/pam.d/su ] && ! grep -qE '^auth[[:space:]]+required[[:space:]]+pam_wheel.so' /etc/pam.d/su; then
+    if grep -qE '^auth[[:space:]]+sufficient[[:space:]]+pam_rootok.so' /etc/pam.d/su; then
+      backup_once /etc/pam.d/su pam.d-su
+      getent group legion-su >/dev/null || { groupadd -r legion-su; : >"$STATE/backup/created-group-legion-su"; }
+      sed -i -E '0,/^auth[[:space:]]+sufficient[[:space:]]+pam_rootok.so.*/s//&\nauth       required   pam_wheel.so use_uid group=legion-su/' /etc/pam.d/su
+    else
+      warn "su not limited: /etc/pam.d/su has an unexpected layout"
+    fi
+  fi
+  # No core dumps: they can hold passwords and keys from memory. Ubuntu's
+  # crash reporter (apport) is turned off for the same reason (CIS 1.5).
+  install -d -m 755 /etc/security/limits.d /etc/systemd/coredump.conf.d
+  printf '# Legion Profile: no core dumps\n* hard core 0\n' >/etc/security/limits.d/legion.conf
+  printf '# Legion Profile: no core dumps\n[Coredump]\nStorage=none\nProcessSizeMax=0\n' >/etc/systemd/coredump.conf.d/legion.conf
+  if [ -f /etc/default/apport ]; then
+    backup_once /etc/default/apport
+    [ -e "$STATE/backup/apport-state" ] || systemctl is-enabled apport.service >"$STATE/backup/apport-state" 2>/dev/null || true
+    sed -i -E 's/^enabled=.*/enabled=0/' /etc/default/apport
+    systemctl disable --now apport.service 2>/dev/null || true
+  fi
+}
+
+# SSH server hardening (CIS 5.1), only when an SSH server is installed.
+# Password logins are left as they are, so nobody who logs in with a
+# password is cut off. The settings are checked before sshd reloads them.
+harden_ssh() {
+  [ -x /usr/sbin/sshd ] && [ -d /etc/ssh/sshd_config.d ] || return 0
+  local f=/etc/ssh/sshd_config.d/00-legion.conf root="no"
+  # Someone logging in as root with a key keeps that ability.
+  if [ -s /root/.ssh/authorized_keys ]; then
+    root="prohibit-password"
+    warn "SSH: root logs in with a key here, so root login stays allowed with keys only"
+  fi
+  cat >"$f" <<EOF
+# Legion Profile: SSH server hardening (CIS 5.1). Password logins are left
+# as they were.
+Banner /etc/issue.net
+PermitRootLogin $root
+PermitEmptyPasswords no
+HostbasedAuthentication no
+IgnoreRhosts yes
+MaxAuthTries 4
+MaxStartups 10:30:60
+MaxSessions 10
+LoginGraceTime 60
+ClientAliveInterval 300
+ClientAliveCountMax 3
+LogLevel VERBOSE
+X11Forwarding no
+EOF
+  chmod 600 "$f"
+  if sshd -t 2>/dev/null; then
+    systemctl try-reload-or-restart ssh.service 2>/dev/null || true
+    info "SSH server hardened"
+  else
+    rm -f "$f"
+    warn "SSH server settings not changed: sshd did not accept them"
+  fi
+}
+
+# The kernel settings Legion changes, saved once per setting before any step
+# runs, so legion-remove.sh can put back the values this machine had. (The
+# firewall and crash reporter steps change some of them too.) Later Legion
+# versions add settings; those are saved on their first run.
+save_sysctl_backup() {
+  [ "$IN_CONTAINER" = 0 ] || return 0
+  install -d -m 700 "$STATE/backup"
+  local key
+  for key in kernel.kptr_restrict fs.suid_dumpable fs.protected_fifos net.core.bpf_jit_harden \
+    net.ipv4.conf.all.log_martians net.ipv4.conf.default.log_martians \
+    net.ipv4.conf.all.send_redirects net.ipv4.conf.default.send_redirects \
+    net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6 \
+    kernel.dmesg_restrict kernel.yama.ptrace_scope kernel.randomize_va_space \
+    net.ipv4.conf.all.accept_redirects net.ipv4.conf.default.accept_redirects \
+    net.ipv4.conf.all.secure_redirects net.ipv4.conf.default.secure_redirects \
+    net.ipv4.conf.all.accept_source_route net.ipv4.conf.default.accept_source_route \
+    net.ipv4.icmp_echo_ignore_broadcasts net.ipv4.icmp_ignore_bogus_error_responses net.ipv4.tcp_syncookies \
+    net.ipv6.conf.all.accept_redirects net.ipv6.conf.default.accept_redirects \
+    net.ipv6.conf.all.accept_source_route net.ipv6.conf.default.accept_source_route; do
+    grep -q "^$key=" "$STATE/backup/sysctl" 2>/dev/null || echo "$key=$(sysctl -n "$key" 2>/dev/null)" >>"$STATE/backup/sysctl"
+  done
 }
 
 step_hardening() {
   # Low-risk subset of the Lynis/CIS kernel checks. Left alone on purpose:
   # ip_forward (Docker and VMs need it), rp_filter (VPNs), sysrq,
   # modules_disabled and unprivileged_bpf_disabled (Ubuntu's default is fine).
-  if [ ! -f "$STATE/backup/sysctl" ] && [ "$IN_CONTAINER" = 0 ]; then
-    install -d -m 700 "$STATE/backup"
-    local key
-    for key in kernel.kptr_restrict fs.suid_dumpable fs.protected_fifos net.core.bpf_jit_harden \
-      net.ipv4.conf.all.log_martians net.ipv4.conf.default.log_martians \
-      net.ipv4.conf.all.send_redirects net.ipv4.conf.default.send_redirects \
-      net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6; do
-      echo "$key=$(sysctl -n "$key" 2>/dev/null)"
-    done >"$STATE/backup/sysctl"
-  fi
+  # CIS 1.5 and 3.3. Left alone on purpose: ip_forward (Docker and VMs),
+  # rp_filter (VPNs) and IPv6 router advertisements (IPv6 needs them).
   cat >/etc/sysctl.d/60-legion-hardening.conf <<'EOF'
 kernel.kptr_restrict = 2
+kernel.dmesg_restrict = 1
+kernel.yama.ptrace_scope = 1
+kernel.randomize_va_space = 2
 fs.suid_dumpable = 0
 fs.protected_fifos = 2
 net.core.bpf_jit_harden = 2
@@ -932,6 +1221,19 @@ net.ipv4.conf.all.log_martians = 1
 net.ipv4.conf.default.log_martians = 1
 net.ipv4.conf.all.send_redirects = 0
 net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.secure_redirects = 0
+net.ipv4.conf.default.secure_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+net.ipv4.tcp_syncookies = 1
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+net.ipv6.conf.all.accept_source_route = 0
+net.ipv6.conf.default.accept_source_route = 0
 EOF
   if [ "$IN_CONTAINER" = 0 ]; then
     sysctl -q -p /etc/sysctl.d/60-legion-hardening.conf || warn "some kernel settings apply only after a reboot"
@@ -973,6 +1275,18 @@ install sctp /bin/false
 install rds /bin/false
 install tipc /bin/false
 EOF
+  # Filesystems a laptop does not need (CIS 1.1.1). Kept: squashfs (snaps),
+  # overlay (Docker), vfat and exfat (USB drives and SD cards). A module
+  # that is loaded right now stays loaded until the next reboot.
+  cat >/etc/modprobe.d/legion-filesystems.conf <<'EOF'
+install cramfs /bin/false
+install freevxfs /bin/false
+install hfs /bin/false
+install hfsplus /bin/false
+install jffs2 /bin/false
+install udf /bin/false
+EOF
+  harden_ssh
   [ ! -f /etc/crontab ] || chmod 600 /etc/crontab
   local d
   for d in /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /etc/cron.monthly /etc/cron.yearly; do
@@ -1332,13 +1646,14 @@ step_login() {
   if [ -f "$g" ]; then
     backup_once "$g" gdm3-greeter.dconf-defaults
     awk -v text="$text" -v logo="$logo" '
-      /^#? *banner-message-(enable|text)=/ && insec { next }
+      /^#? *(banner-message-(enable|text)|disable-user-list)=/ && insec { next }
       /^logo=/ && insec { next }
       /^\[/ { insec = ($0 == "[org/gnome/login-screen]") }
       { print }
       insec && $0 == "[org/gnome/login-screen]" {
         print "banner-message-enable=true"
         print "banner-message-text=\x27" text "\x27"
+        print "disable-user-list=true"
         if (logo != "") print "logo=\x27" logo "\x27"
         done = 1
       }
@@ -1346,10 +1661,13 @@ step_login() {
         if (!done) {
           print ""; print "[org/gnome/login-screen]"
           print "banner-message-enable=true"; print "banner-message-text=\x27" text "\x27"
+          print "disable-user-list=true"
           if (logo != "") print "logo=\x27" logo "\x27"
         }
       }' "$g" >"$g.legion" && cat "$g.legion" >"$g" && rm -f "$g.legion"
-    # Rebuild GDM's settings now, so the next login screen shows the banner.
+    # The login screen also stops listing user names (CIS 1.7): people type
+    # their user name. Rebuild GDM's settings now, so the next login screen
+    # shows all this.
     [ ! -x /usr/share/gdm/generate-config ] || /usr/share/gdm/generate-config || true
     if [ -n "$logo" ]; then info "login screen banner and LEGION logo set"; else info "login screen banner set (logo image not found next to legion.sh)"; fi
   else
@@ -1376,6 +1694,13 @@ EOF
 /org/gnome/desktop/screensaver/lock-delay
 EOF
     info "screen locks after 10 minutes idle; users cannot turn this off"
+    # Inserted USB drives and discs never start programs by themselves
+    # (CIS 1.7, 800-171 3.8.7). Drives still mount as usual.
+    cat >/etc/dconf/db/local.d/00-legion-media <<'EOF'
+[org/gnome/desktop/media-handling]
+autorun-never=true
+EOF
+    echo /org/gnome/desktop/media-handling/autorun-never >/etc/dconf/db/local.d/locks/00-legion-media
   else
     warn "custom user settings profile found; screen lock not enforced"
   fi
@@ -1448,10 +1773,84 @@ EOF
   systemctl daemon-reload
   systemctl enable --now legion-check.timer
   info "installed as 'legion'; a daily check at 06:30 flags any check that starts failing"
+  # Weekly vulnerability scan (800-171 3.11.2): Ubuntu's security notices
+  # (OVAL), checked against the installed packages with OpenSCAP. Lists the
+  # known vulnerabilities on this device with their CVE numbers. A finding
+  # fails the service, like the malware scans.
+  command -v oscap >/dev/null || { warn "OpenSCAP not available; vulnerability scan skipped"; return 0; }
+  cat >/usr/local/sbin/legion-vuln-scan <<'EOF'
+#!/bin/bash
+# Legion Profile: weekly vulnerability scan with Ubuntu's OVAL data.
+set -euo pipefail
+. /etc/os-release
+dir=/var/lib/legion/oval log=/var/log/legion
+install -d -m 700 "$dir"
+url="https://security-metadata.canonical.com/oval/com.ubuntu.${VERSION_CODENAME}.usn.oval.xml.bz2"
+python3 -I -c '
+import bz2, shutil, sys, urllib.request
+urllib.request.urlretrieve(sys.argv[1], sys.argv[2] + ".bz2.new")
+with bz2.open(sys.argv[2] + ".bz2.new") as src, open(sys.argv[2] + ".new", "wb") as dst:
+    shutil.copyfileobj(src, dst)' "$url" "$dir/usn.oval.xml"
+rm -f "$dir/usn.oval.xml.bz2.new"
+mv -f "$dir/usn.oval.xml.new" "$dir/usn.oval.xml"
+rc=0
+oscap oval eval --results "$dir/results.xml" --report "$log/vuln-report.html" "$dir/usn.oval.xml" >"$dir/eval.txt" 2>&1 || rc=$?
+if [ "$rc" -gt 2 ] || ! grep -q '^Definition ' "$dir/eval.txt"; then
+  echo "the OVAL scan did not run (oscap exit $rc); see $dir/eval.txt"
+  exit 2
+fi
+# Security notices (class "patch") that apply, by number and title. Other
+# true definitions, such as "this is Ubuntu 26.04", are not findings.
+python3 -I -c '
+import re, sys
+import xml.etree.ElementTree as ET
+hits = set(re.findall(r"^Definition (\S+): true$", open(sys.argv[2]).read(), re.M))
+ns = {"o": "http://oval.mitre.org/XMLSchema/oval-definitions-5"}
+for d in ET.parse(sys.argv[1]).getroot().iterfind(".//o:definition", ns):
+    if d.get("id") in hits and d.get("class") == "patch":
+        print(d.findtext("o:metadata/o:title", "", ns).strip())' "$dir/usn.oval.xml" "$dir/eval.txt" | sort >"$log/vuln-scan.txt"
+chmod 640 "$log/vuln-report.html" "$log/vuln-scan.txt"
+n="$(grep -c . "$log/vuln-scan.txt" || true)"
+echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $n" >"$dir/last"
+if [ "$n" -gt 0 ]; then
+  echo "$n Ubuntu security notice(s) apply to installed packages; see $log/vuln-report.html"
+  exit 1
+fi
+echo "no known vulnerabilities in installed packages"
+EOF
+  chmod 750 /usr/local/sbin/legion-vuln-scan
+  cat >/etc/systemd/system/legion-vuln-scan.service <<'EOF'
+[Unit]
+Description=Weekly Legion Profile vulnerability scan (Ubuntu OVAL)
+Wants=network-online.target
+After=network-online.target
+[Service]
+Type=oneshot
+Nice=19
+IOSchedulingClass=idle
+ExecStart=/usr/local/sbin/legion-vuln-scan
+EOF
+  cat >/etc/systemd/system/legion-vuln-scan.timer <<'EOF'
+[Unit]
+Description=Weekly Legion Profile vulnerability scan (Ubuntu OVAL)
+[Timer]
+OnCalendar=Sat 04:00
+RandomizedDelaySec=1h
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable legion-vuln-scan.timer
+  systemctl start legion-vuln-scan.timer
+  # The first scan runs now, in the background.
+  [ -f /var/lib/legion/oval/last ] || systemctl start --no-block legion-vuln-scan.service
+  info "weekly vulnerability scan set up; the first one is running now"
 }
 
 if [ "$READONLY" = 0 ]; then
   section "Deploying profile"
+  save_sysctl_backup
   [ "$WITH_PRO" = 0 ] || run_step "Ubuntu Pro: ESM security updates and Livepatch" step_pro
   run_step "Patching: install all pending updates" step_patching
   PATCH_FAILED=0
@@ -1459,17 +1858,18 @@ if [ "$READONLY" = 0 ]; then
   run_step "NVIDIA driver ready for the new kernel" step_nvidia
   run_step "Automatic security updates" step_auto_updates
   run_step "Firewall: block inbound, allow outbound" step_firewall
-  run_step "Audit logging (auditd)" step_audit
   run_step "Log retention: 1 year, capped at 2 GB" step_logs
   run_step "Malware protection: ClamAV, weekly scan of /home" step_clamav
-  run_step "Password policy: 12+ characters, 3 types" step_passwords
-  run_step "System hardening: kernel, protocols, permissions" step_hardening
+  run_step "Passwords: 12+ characters, last 24 refused, 90-day age" step_passwords
+  run_step "Sessions: idle timeout, umask, sudo, su, no core dumps" step_session
+  run_step "System hardening: kernel, filesystems, protocols, SSH" step_hardening
   [ "$YARA" = 0 ] || run_step "YARA: weekly scan of user-writable folders" step_yara
   [ "$AIDE" = 0 ] || run_step "Integrity: package checksums and AIDE, daily" step_integrity
   run_step "Login: banner and enforced screen lock" step_login
   [ "$LOCKOUT" = 0 ] || run_step "Account lockout: 5 failed logins, 30 minutes" step_lockout
   [ "$TOOLS" = 0 ] || run_step "Tools: audit, secrets, backups, Terraform, Trivy" step_tools
-  run_step "Compliance: daily check, SCAP content" step_compliance
+  run_step "Audit logging (auditd)" step_audit
+  run_step "Compliance: daily check, weekly vulnerability scan" step_compliance
   # Legion's own later steps change files AIDE watches; accept them (logged in
   # integrity.log) so the next daily check does not report them.
   if [ -x /usr/local/sbin/legion-aide-baseline ] && [ -f "$STATE/aide/aide.db" ]; then
@@ -1543,7 +1943,7 @@ c_audit_rules() {
   in_container && return 2
   local r k
   r="$(auditctl -l 2>/dev/null)"
-  for k in identity privilege time modules; do
+  for k in identity privilege user_emulation session logins system-locale time modules perm_mod access mounts delete MAC-policy privileged; do
     # auditctl -l shows file watches as "-k NAME" and syscall rules as "key=NAME".
     grep -qE -- "(-k |key=)$k( |$)" <<<"$r" || { NOTE="audit rules for '$k' not loaded"; return 1; }
   done
@@ -1633,6 +2033,11 @@ c_ssh() {
   if ! ss -ltnH 2>/dev/null | awk '{ print $4 }' | grep -qE ':22$'; then NOTE="no SSH server listening"; return 0; fi
   local t
   t="$(sshd -T 2>/dev/null)"
+  local n
+  n="$(awk '$1 == "maxauthtries" { print $2 }' <<<"$t")"
+  if ! { [ "${n:-6}" -le 4 ] && grep -qx 'x11forwarding no' <<<"$t" && grep -qx 'permitemptypasswords no' <<<"$t"; }; then
+    NOTE="SSH server not hardened (run Legion again)"; return 1
+  fi
   grep -qx 'permitrootlogin no' <<<"$t" && grep -qx 'passwordauthentication no' <<<"$t" && return 0
   NOTE="SSH allows root or password logins"; return 1
 }
@@ -1666,6 +2071,13 @@ c_perms() {
     [ ! -d "$d" ] || [ "$(stat -c %a "$d")" = 700 ] || { NOTE="$d is readable by other users"; return 1; }
   done
   [ ! -d /etc/sudoers.d ] || [ "$(stat -c %a /etc/sudoers.d)" = 750 ] || { NOTE="/etc/sudoers.d is readable by other users"; return 1; }
+  # Account files: Ubuntu's own permissions or stricter.
+  local f max
+  for f in /etc/passwd:644 /etc/group:644 /etc/shadow:640 /etc/gshadow:640 /etc/passwd-:644 /etc/group-:644 /etc/shadow-:640 /etc/gshadow-:640; do
+    max="${f#*:}" f="${f%:*}"
+    [ -e "$f" ] || continue
+    [ $((8#$(stat -c %a "$f") & ~8#$max)) = 0 ] && [ "$(stat -c %u "$f")" = 0 ] || { NOTE="$f has loose permissions"; return 1; }
+  done
 }
 c_empty_passwords() {
   awk -F: '$2 == "" { f = 1 } END { exit !f }' /etc/shadow && { NOTE="an account has no password"; return 1; }
@@ -1688,20 +2100,203 @@ c_scap() {
   NOTE="$fails CIS Level 1 Workstation rules fail; see cis-scap-report.html"; return 1
 }
 
+# Accounts of real people: login ID 1000 and up (the login screen's own
+# temporary accounts start at 60000).
+human_uid() { [ "$1" -ge 1000 ] 2>/dev/null && [ "$1" -lt 60000 ]; }
+c_pwhistory() {
+  local r
+  r="$(grep -E '^[^#]*pam_pwhistory.so' /etc/pam.d/common-password 2>/dev/null | grep -o 'remember=[0-9]*' | head -n 1)"
+  [ "${r#remember=}" -ge 24 ] 2>/dev/null && return 0
+  NOTE="recent passwords can be reused (needs the last 24 refused)"; return 1
+}
+c_pwage() {
+  local max u h m uid bad=""
+  max="$(awk '$1 == "PASS_MAX_DAYS" { print $2 }' /etc/login.defs)"
+  if ! { [ "${max:-0}" -ge 1 ] && [ "$max" -le 90 ]; } 2>/dev/null; then NOTE="new accounts' passwords do not expire within 90 days"; return 1; fi
+  while IFS=: read -r u h _ _ m _; do
+    case "$h" in "" | '!'* | '*'*) continue ;; esac
+    if ! uid="$(id -u "$u" 2>/dev/null)" || ! human_uid "$uid"; then continue; fi
+    { [ "${m:-0}" -ge 1 ] && [ "$m" -le 90 ]; } 2>/dev/null || bad+=" $u"
+  done </etc/shadow
+  [ -z "$bad" ] && return 0
+  NOTE="passwords that do not expire within 90 days:$bad"; return 1
+}
+c_inactive() {
+  local d u h i uid bad=""
+  d="$(sed -n 's/^INACTIVE=//p' /etc/default/useradd 2>/dev/null | tail -n 1)"
+  if ! { [ "${d:--1}" -ge 0 ] && [ "$d" -le 45 ]; } 2>/dev/null; then NOTE="new accounts are not disabled after inactivity"; return 1; fi
+  while IFS=: read -r u h _ _ _ _ i _; do
+    case "$h" in "" | '!'* | '*'*) continue ;; esac
+    if ! uid="$(id -u "$u" 2>/dev/null)" || ! human_uid "$uid"; then continue; fi
+    { [ "${i:--1}" -ge 0 ] && [ "$i" -le 45 ]; } 2>/dev/null || bad+=" $u"
+  done </etc/shadow
+  [ -z "$bad" ] && return 0
+  NOTE="accounts never disabled after inactivity:$bad"; return 1
+}
+c_shells() {
+  local bad
+  bad="$(awk -F: '($3 < 1000 || $3 == 65534) && $1 != "root" && $7 !~ /(nologin|false|sync|shutdown|halt)$/ { printf " %s", $1 }' /etc/passwd)"
+  [ -z "$bad" ] && return 0
+  NOTE="system accounts with a login shell:$bad"; return 1
+}
+c_session_timeout() {
+  grep -qs '^ *TMOUT=900' /etc/profile.d/legion-session.sh && return 0
+  NOTE="idle console and SSH shells do not end"; return 1
+}
+c_umask() {
+  local m
+  m="$(awk '$1 == "UMASK" { print $2 }' /etc/login.defs)"
+  case "$m" in 027 | 0027 | 077 | 0077) return 0 ;; esac
+  NOTE="new files are readable by other users (umask ${m:-022})"; return 1
+}
+c_sudo() {
+  local d t
+  d="$(cat /etc/sudoers /etc/sudoers.d/* 2>/dev/null | grep -E '^[[:space:]]*Defaults')"
+  grep -qw use_pty <<<"$d" || { NOTE="sudo does not run commands in their own terminal (use_pty)"; return 1; }
+  t="$(grep -o 'timestamp_timeout=-\?[0-9]*' <<<"$d" | tail -n 1)"
+  t="${t#timestamp_timeout=}"
+  if [ -n "$t" ] && { [ "$t" -lt 0 ] || [ "$t" -gt 15 ]; }; then NOTE="sudo remembers the password for more than 15 minutes"; return 1; fi
+}
+c_su() {
+  local g
+  g="$(grep -E '^auth[[:space:]]+required[[:space:]]+pam_wheel.so' /etc/pam.d/su 2>/dev/null | grep -o 'group=[^ ]*' | head -n 1)"
+  g="${g#group=}"
+  [ -n "$g" ] || { NOTE="any user who knows root's password can use su"; return 1; }
+  [ -z "$(getent group "$g" | cut -d: -f4)" ] && return 0
+  NOTE="members of $g can use su"; return 1
+}
+c_coredumps() {
+  grep -qsE '^\*[[:space:]]+hard[[:space:]]+core[[:space:]]+0' /etc/security/limits.conf /etc/security/limits.d/*.conf ||
+    { NOTE="core dumps are allowed"; return 1; }
+  grep -qs '^Storage=none' /etc/systemd/coredump.conf /etc/systemd/coredump.conf.d/*.conf || { NOTE="systemd stores core dumps"; return 1; }
+  if [ -f /etc/default/apport ] && ! grep -q '^enabled=0' /etc/default/apport; then NOTE="crash reporter (apport) is on"; return 1; fi
+}
+c_filesystems() {
+  local m
+  for m in cramfs freevxfs hfs hfsplus jffs2 udf; do
+    grep -qsE "^install[[:space:]]+${m}[[:space:]]+/bin/(false|true)" /etc/modprobe.d/*.conf || { NOTE="$m filesystem not blocked"; return 1; }
+  done
+}
+c_media() {
+  [ -f /usr/share/glib-2.0/schemas/org.gnome.desktop.media-handling.gschema.xml ] || { NOTE="no GNOME desktop"; return 2; }
+  grep -qsx 'autorun-never=true' /etc/dconf/db/local.d/00-legion-media &&
+    grep -qsx /org/gnome/desktop/media-handling/autorun-never /etc/dconf/db/local.d/locks/00-legion-media && return 0
+  NOTE="inserted media can start programs"; return 1
+}
+c_userlist() {
+  [ -f /etc/gdm3/greeter.dconf-defaults ] || { NOTE="no GDM login screen"; return 2; }
+  awk '/^\[/ { s = ($0 == "[org/gnome/login-screen]") } s && /^disable-user-list=true$/ { f = 1 } END { exit !f }' /etc/gdm3/greeter.dconf-defaults && return 0
+  NOTE="the login screen lists user names"; return 1
+}
+c_audit_alert() {
+  grep -qE '^space_left_action[[:space:]]*=[[:space:]]*(email|exec|single|halt)' /etc/audit/auditd.conf 2>/dev/null ||
+    { NOTE="no alert when the audit log disk runs low"; return 1; }
+  if [ -n "$(find /var/lib/legion/audit-space-low -mtime -7 2>/dev/null)" ]; then
+    NOTE="audit log disk ran low on $(cat /var/lib/legion/audit-space-low); free up space"; return 1
+  fi
+}
+c_vulns() {
+  local f=/var/lib/legion/oval/last when n age
+  systemctl is-enabled -q legion-vuln-scan.timer 2>/dev/null || { NOTE="vulnerability scan not set up"; return 1; }
+  [ -f "$f" ] || { NOTE="first scan not finished yet"; return 2; }
+  read -r when n <"$f"
+  age=$((($(date +%s) - $(date -d "$when" +%s 2>/dev/null || echo 0)) / 86400))
+  if last_run_failed legion-vuln-scan.service && [ "${n:-0}" = 0 ]; then NOTE="the last scan could not run; see: systemctl status legion-vuln-scan"; return 1; fi
+  [ "$age" -le 14 ] || { NOTE="last scan was $age days ago"; return 1; }
+  [ "${n:-0}" = 0 ] && { NOTE="no known vulnerabilities on $when"; return 0; }
+  NOTE="$n Ubuntu security notice(s) apply: $(head -n 1 "$LOGDIR/vuln-scan.txt" 2>/dev/null)$([ "$n" -gt 1 ] && echo ", ..."). Install updates; see vuln-report.html"; return 1
+}
+# One pass over the local disks for the file checks below, shared by them.
+fs_scan() {
+  [ -f "$FLAGS/fs-scan" ] && return 0
+  local mounts=()
+  local_disks
+  nice -n 19 ionice -c 3 find "${mounts[@]}" -xdev \
+    \( -path /proc -o -path /sys -o -path /var/lib/docker -o -path /var/lib/containers -o -path /snap -o -path /var/snap \) -prune \
+    -o \( -type f -perm -0002 -printf 'ww %p\n' \) \
+    -o \( -type d -perm -0002 ! -perm -1000 -printf 'wd %p\n' \) \
+    -o \( \( -nouser -o -nogroup \) -printf 'un %p\n' \) \
+    -o \( -type f \( -perm -4000 -o -perm -2000 \) -printf 'su %p\n' \) >"$FLAGS/fs-scan.new" 2>/dev/null || true
+  sort -u "$FLAGS/fs-scan.new" >"$FLAGS/fs-scan"
+}
+fs_list() { # kind... ; prints matching paths
+  local k
+  for k in "$@"; do sed -n "s/^$k //p" "$FLAGS/fs-scan"; done
+}
+fs_note() { # count label; first 3 paths from stdin
+  local n="$1" l="$2" first
+  first="$(head -n 3 | tr '\n' ' ')"
+  NOTE="$n $l: ${first% }$([ "$n" -gt 3 ] && echo ", ...")"
+}
+c_world_writable() {
+  fs_scan
+  local n
+  n="$(fs_list ww wd | grep -c . || true)"
+  [ "$n" = 0 ] && return 0
+  fs_list ww wd | fs_note "$n" "world-writable files or folders without the sticky bit"
+  return 1
+}
+c_unowned() {
+  fs_scan
+  local n
+  n="$(fs_list un | grep -c . || true)"
+  [ "$n" = 0 ] && return 0
+  fs_list un | fs_note "$n" "files with no owner or group"
+  return 1
+}
+c_privileged() {
+  fs_scan
+  local n
+  fs_list su >"$LOGDIR/privileged-programs.txt"
+  # usr-merge: a package may list /bin/x for what is now /usr/bin/x.
+  cat /var/lib/dpkg/info/*.list 2>/dev/null >"$FLAGS/dpkg-files"
+  awk 'NR == FNR { p[$0] = 1; next } { g = $0; sub(/^\/usr/, "", g) } !($0 in p) && !(g in p) && !(("/usr" $0) in p)' \
+    "$FLAGS/dpkg-files" "$LOGDIR/privileged-programs.txt" >"$FLAGS/unpackaged"
+  n="$(grep -c . "$FLAGS/unpackaged" || true)"
+  if [ "$n" = 0 ]; then NOTE="$(grep -c . "$LOGDIR/privileged-programs.txt") setuid/setgid programs, all from packages"; return 0; fi
+  fs_note "$n" "setuid/setgid programs not from any package" <"$FLAGS/unpackaged"
+  return 1
+}
+c_dup_ids() {
+  local d
+  d="$({
+    cut -d: -f3 /etc/passwd | sort | uniq -d | sed 's/^/UID /'
+    cut -d: -f1 /etc/passwd | sort | uniq -d | sed 's/^/user /'
+    cut -d: -f3 /etc/group | sort | uniq -d | sed 's/^/GID /'
+    cut -d: -f1 /etc/group | sort | uniq -d | sed 's/^/group /'
+  } | tr '\n' ' ')"
+  [ -z "$d" ] && return 0
+  NOTE="duplicates: ${d% }"; return 1
+}
+c_homes() {
+  local u uid home m bad=""
+  while IFS=: read -r u _ uid _ _ home _; do
+    human_uid "$uid" && [ -d "$home" ] || continue
+    m="$(stat -c %a "$home")"
+    [ $((8#$m & 8#027)) = 0 ] || bad+=" $home ($m)"
+  done </etc/passwd
+  [ -z "$bad" ] && return 0
+  NOTE="home folders open to other users:$bad (fix: chmod 750)"; return 1
+}
+
 # id | check | function | SOC 2 | HIPAA | NIST 800-53 | NIST 800-171 / CMMC L2
 CHECKS=(
   "disk-encryption|Full-disk encryption|c_encryption|CC6.1|164.312(a)(2)(iv)|SC-28|3.13.16"
   "fips|FIPS-validated cryptography|c_fips|CC6.1|164.312(a)(2)(iv)|SC-13|3.13.11"
   "security-updates|No pending security updates|c_updates|CC7.1|164.308(a)(1)(ii)(B)|SI-2|3.14.1"
   "auto-updates|Automatic security updates|c_autoupdates|CC7.1|164.308(a)(1)(ii)(B)|SI-2|3.14.1"
+  "vulnerability-scan|Weekly vulnerability scan, nothing open|c_vulns|CC7.1|164.308(a)(1)(ii)(A)|RA-5|3.11.2"
   "ubuntu-pro|Ubuntu Pro (ESM security updates)|c_pro|CC7.1|164.308(a)(1)(ii)(B)|SI-2|3.14.1"
   "livepatch|Livepatch (kernel fixes without reboot)|c_livepatch|CC7.1|-|SI-2|3.14.1"
   "firewall|Firewall blocks incoming connections|c_firewall|CC6.6|-|SC-7|3.13.1"
   "listeners|No reachable network services|c_listeners|CC6.6|-|CM-7|3.4.7"
   "ssh|SSH hardened or off|c_ssh|CC6.6|164.312(a)(1)|CM-7|3.4.7"
   "protocols|Unused network protocols blocked|c_protocols|CC6.6|-|CM-7|3.4.6"
+  "filesystems|Unused filesystems blocked|c_filesystems|CC6.8|-|CM-7|3.4.6"
+  "media-autorun|USB drives and discs never start programs|c_media|CC6.8|-|CM-7|3.8.7"
   "auditd|Audit logging running|c_auditd|CC7.2|164.312(b)|AU-12|3.3.1"
-  "audit-rules|Audit rules for accounts, sudo, time, modules|c_audit_rules|CC7.2|164.312(b)|AU-2|3.3.1"
+  "audit-rules|Audit rules (CIS set: accounts, sudo, logins, access, changes)|c_audit_rules|CC7.2|164.312(b)|AU-2|3.3.1"
+  "audit-alert|Alert when the audit log disk runs low|c_audit_alert|CC7.2|164.312(b)|AU-5|3.3.4"
   "log-retention|System logs kept for 1 year|c_log_retention|CC7.2|164.312(b)|AU-11|3.3.1"
   "log-protection|Audit logs readable only by admins|c_log_protect|CC7.2|164.312(b)|AU-9|3.3.8"
   "time-sync|Clock synchronized|c_time|CC7.2|164.312(b)|AU-8|3.3.7"
@@ -1712,13 +2307,28 @@ CHECKS=(
   "apparmor|AppArmor confinement|c_apparmor|CC6.8|-|AC-3(3)|-"
   "kernel|Kernel hardening settings|c_kernel|CC7.1|-|CM-6|3.4.2"
   "aslr|Full memory address randomization|c_aslr|CC6.8|-|SI-16|-"
+  "core-dumps|No core dumps or crash reports|c_coredumps|CC6.1|-|CM-6|3.4.2"
   "password-policy|Password length and complexity|c_password|CC6.1|164.308(a)(5)(ii)(D)|IA-5(1)|3.5.7"
+  "password-history|Last 24 passwords cannot be reused|c_pwhistory|CC6.1|164.308(a)(5)(ii)(D)|IA-5(1)|3.5.8"
+  "password-age|Passwords expire within 90 days|c_pwage|CC6.1|164.308(a)(5)(ii)(D)|IA-5(1)|-"
+  "inactive-accounts|Inactive accounts disabled after 45 days|c_inactive|CC6.2|164.308(a)(3)(ii)(C)|AC-2(3)|3.5.6"
+  "duplicate-ids|No duplicate user or group IDs|c_dup_ids|CC6.1|164.312(a)(2)(i)|IA-2|3.5.1"
+  "system-shells|System accounts cannot log in|c_shells|CC6.1|-|AC-2|3.1.1"
   "lockout|Lockout after failed logins|c_lockout|CC6.1|164.308(a)(5)(ii)(C)|AC-7|3.1.8"
   "empty-passwords|No accounts without a password|c_empty_passwords|CC6.1|164.312(d)|IA-2|3.5.2"
   "uid0|Only root has UID 0|c_uid0|CC6.1|164.312(a)(1)|AC-6|3.1.5"
-  "permissions|Cron and sudoers locked to admins|c_perms|CC6.1|164.312(a)(1)|AC-6|3.1.5"
+  "permissions|Cron, sudoers and account files locked to admins|c_perms|CC6.1|164.312(a)(1)|AC-6|3.1.5"
+  "home-folders|Home folders closed to other users|c_homes|CC6.1|164.312(a)(1)|AC-3|3.1.1"
+  "world-writable|No world-writable files|c_world_writable|CC6.1|164.312(a)(1)|AC-3|3.1.1"
+  "unowned-files|No files without an owner|c_unowned|CC6.1|-|CM-6|3.4.2"
+  "privileged-programs|Setuid programs all come from packages|c_privileged|CC6.8|-|CM-7|3.4.7"
+  "sudo|sudo: own terminal, 15-minute password timeout|c_sudo|CC6.1|164.312(b)|AC-6(9)|3.1.7"
+  "su|su limited to root|c_su|CC6.1|-|AC-6|3.1.5"
+  "session-timeout|Idle console and SSH sessions end|c_session_timeout|CC6.1|164.312(a)(2)(iii)|AC-12|3.1.11"
+  "umask|New files private by default (umask 027)|c_umask|CC6.1|-|CM-6|3.4.2"
   "screen-lock|Enforced screen lock|c_screenlock|CC6.1|164.312(a)(2)(iii)|AC-11|3.1.10"
   "banner|Login banner|c_banner|-|-|AC-8|3.1.9"
+  "login-user-list|Login screen hides user names|c_userlist|CC6.1|-|CM-6|3.4.2"
   "cis-scap|CIS benchmark scan (OpenSCAP)|c_scap|CC7.1|-|CM-6|3.4.2"
 )
 # Evidence these frameworks need that no device check can provide.
@@ -1823,12 +2433,17 @@ make_bundle() {
   cp "$LOGDIR"/compliance-report.* "$b/reports/" 2>/dev/null || true
   cp "$LOGDIR"/cis-scap-report.html "$b/reports/" 2>/dev/null || true
   [ ! -s "$RUNLOG" ] || cp "$RUNLOG" "$b/logs/"
-  for f in yara-scan.log integrity.log; do [ ! -f "$LOGDIR/$f" ] || tail -n 2000 "$LOGDIR/$f" >"$b/logs/$f"; done
+  for f in yara-scan.log integrity.log vuln-scan.txt privileged-programs.txt; do [ ! -f "$LOGDIR/$f" ] || tail -n 2000 "$LOGDIR/$f" >"$b/logs/$f"; done
+  cp "$LOGDIR"/vuln-report.html "$b/reports/" 2>/dev/null || true
   for f in /etc/audit/rules.d/legion.rules /etc/systemd/journald.conf.d/legion.conf \
     /etc/security/pwquality.conf.d/legion.conf /etc/sysctl.d/60-legion-hardening.conf \
     /etc/modprobe.d/legion-uncommon-net.conf /etc/apt/apt.conf.d/20auto-upgrades /etc/legion/aide.conf \
-    /etc/dconf/db/local.d/00-legion-screenlock /etc/dconf/db/gdm.d/01-legion-banner /etc/issue \
-    /etc/pam.d/common-auth /etc/pam.d/common-account; do
+    /etc/dconf/db/local.d/00-legion-screenlock /etc/issue \
+    /etc/pam.d/common-auth /etc/pam.d/common-account /etc/pam.d/common-password /etc/pam.d/su \
+    /etc/login.defs /etc/default/useradd /etc/profile.d/legion-session.sh /etc/sudoers.d/legion \
+    /etc/security/limits.d/legion.conf /etc/systemd/coredump.conf.d/legion.conf /etc/modprobe.d/legion-filesystems.conf \
+    /etc/ssh/sshd_config.d/00-legion.conf /etc/audit/auditd.conf /etc/gdm3/greeter.dconf-defaults \
+    /etc/dconf/db/local.d/00-legion-media; do
     [ ! -f "$f" ] || cp "$f" "$b/settings/$(echo "${f#/}" | tr / _)"
   done
   {
