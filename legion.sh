@@ -21,6 +21,7 @@
 #   --steam              allow Steam Remote Play from the local network
 #   --no-yara            skip the weekly YARA scan
 #   --no-aide            skip the daily integrity check
+#   --no-sigma           skip threat detection (Sigma rules on the audit log)
 #   --no-pro             don't ask for an Ubuntu Pro token
 #   --pro-token-file F   read the Ubuntu Pro token from file F instead of asking
 #   --with-tools         also install lynis, gitleaks, pre-commit, shellcheck,
@@ -273,7 +274,7 @@ banner() {
 
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; }
 
-ALLOW_UNENCRYPTED=0 STEAM=0 TOOLS=0 YARA=1 AIDE=1 PRO=1 LOCKOUT=1 REPORT_ONLY=0 CHECK=0 DRIFT_ONLY=0 BANNER_SHOWN=0
+ALLOW_UNENCRYPTED=0 STEAM=0 TOOLS=0 YARA=1 AIDE=1 SIGMA=1 PRO=1 LOCKOUT=1 REPORT_ONLY=0 CHECK=0 DRIFT_ONLY=0 BANNER_SHOWN=0
 PRO_TOKEN_FILE=""
 TAILSCALE="" ALLOW_FROM="" ALLOW_FROM_SET=0 IPV6="" SSH_ALLOW="" RDP_ALLOW="" # empty means: ask
 FORWARD="" LOCK_AUDIT="" # empty means: ask on a terminal, otherwise keep the current setting
@@ -285,6 +286,7 @@ while [ $# -gt 0 ]; do
     --with-tools) TOOLS=1 ;;
     --no-yara) YARA=0 ;;
     --no-aide) AIDE=0 ;;
+    --no-sigma) SIGMA=0 ;;
     --no-pro) PRO=0 ;;
     --pro-token-file)
       [ $# -ge 2 ] && [ -f "$2" ] || { echo "--pro-token-file needs a path to a file" >&2; exit 2; }
@@ -725,7 +727,7 @@ add_signed_repo() {
 }
 
 STEP=0
-TOTAL=$((13 + WITH_PRO + YARA + AIDE + LOCKOUT + TOOLS))
+TOTAL=$((13 + WITH_PRO + YARA + AIDE + SIGMA + LOCKOUT + TOOLS))
 RESULTS=()
 FAILED=0
 
@@ -893,6 +895,15 @@ audit_watch() { # key path...
     if [ -e "$f" ]; then echo "-w $f -p wa -k $key"; fi
   done
 }
+# Watches for files an attacker would create, so they need not exist yet; the
+# folder they would be created in must exist, or the rule would not load.
+audit_watch_new() { # key path...
+  local key="$1" f
+  shift
+  for f in "$@"; do
+    if [ -e "$f" ] || [ -d "$(dirname "$f")" ]; then echo "-w $f -p wa -k $key"; fi
+  done
+}
 # Run-watches go on the real program, not a link to it: on Ubuntu 26.04
 # /usr/bin/sudo links to sudo-rs and modprobe/insmod link to kmod, and a
 # watch on a link never fires.
@@ -976,20 +987,39 @@ step_audit() {
     while read -r real; do
       echo "-a always,exit -F path=$real -F perm=x $users -k privileged"
     done < <(privileged_programs)
+    echo "## Commands people run (NIST AU-12, 800-171 3.3.1; read by the Sigma rules)"
+    audit_syscalls "$users" exec execve execveat
+    echo "## Files attackers change to run code at login or hide it (Sigma rules)"
+    audit_watch_new persistence /etc/ld.so.preload /etc/ld.so.conf /etc/ld.so.conf.d /etc/environment \
+      /etc/shells /etc/profile /etc/profile.d /etc/bash.bashrc /etc/rsyslog.conf /etc/syslog.conf \
+      /etc/sysctl.conf /etc/crontab /etc/cron.d /var/spool/cron/crontabs /etc/systemd/user \
+      /root/.bashrc /root/.profile /root/.bash_profile /root/.ssh/authorized_keys
     echo "## Firewall and audit settings"
     audit_watch firewall /etc/ufw
     audit_watch audit-config /etc/audit /etc/libaudit.conf
+    echo "## The audit logs themselves (auditd's own writes are never audited)"
+    audit_watch audit-log /var/log/audit
     echo "## Legion itself: its programs, settings, schedules and baselines"
     audit_watch legion-tamper /usr/local/sbin /etc/legion /var/lib/legion/aide /etc/systemd/system \
       /etc/apt/apt.conf.d/99legion-aide /etc/sudoers.d/legion /usr/share/pam-configs /etc/rsyslog.d \
       /etc/dconf/db/local.d /etc/gdm3/greeter.dconf-defaults /etc/sysctl.d /etc/modprobe.d
     echo "## AI coding agent settings (hooks, MCP servers, permissions)"
     audit_watch ai-agent-config /etc/claude-code
-    local home
+    local home d
     while IFS=: read -r _ _ real _ _ home _; do
       if [ "$real" -ge 1000 ] 2>/dev/null && [ "$real" -lt 60000 ] && [ -d "$home" ]; then
-        audit_watch ai-agent-config "$home/.claude/settings.json" "$home/.claude/settings.local.json" \
+        # A folder is watched as a whole only if it exists, so create the
+        # missing ones a login-time backdoor would go into, empty and private.
+        # (Output here goes into the rules file, so it stays silent.)
+        for d in "$home/.ssh" "$home/.config" "$home/.config/autostart" "$home/.config/systemd" "$home/.config/systemd/user"; do
+          if [ ! -e "$d" ] && install -d -m 700 -o "$real" -g "$(id -g "$real")" "$d" 2>/dev/null; then
+            echo "$d" >>"$STATE/created-dirs"
+          fi
+        done
+        audit_watch_new ai-agent-config "$home/.claude/settings.json" "$home/.claude/settings.local.json" \
           "$home/.mcp.json" "$home/.cursor/mcp.json" "$home/.codex/config.toml" "$home/.gemini/settings.json"
+        audit_watch_new persistence "$home/.bashrc" "$home/.profile" "$home/.bash_profile" \
+          "$home/.ssh/authorized_keys" "$home/.config/autostart" "$home/.config/systemd/user"
       fi
     done </etc/passwd
   } >/etc/audit/rules.d/legion.rules.new
@@ -1033,6 +1063,19 @@ EOF
     return 0
   fi
   systemctl enable auditd
+  # Tamper protection (AU-9, 800-171 3.3.8): auditd cannot be stopped by hand,
+  # even by root, and comes straight back if it is killed. Settings changes
+  # are applied with a reload, which needs no stop.
+  install -d -m 755 /etc/systemd/system/auditd.service.d
+  cat >/etc/systemd/system/auditd.service.d/legion.conf <<'EOF'
+# Legion Profile: keep the audit daemon running.
+[Unit]
+RefuseManualStop=yes
+[Service]
+Restart=always
+RestartSec=1
+EOF
+  systemctl daemon-reload
   if [ "$locked" = 1 ]; then
     # The kernel refuses rule changes until a restart; that is the point.
     rm -f "$conf.legion-prev"
@@ -1040,11 +1083,11 @@ EOF
     info "audit rules are locked: the new rules and settings apply after a restart"
     return 0
   fi
-  systemctl restart auditd 2>/dev/null || systemctl reload auditd 2>/dev/null || true
+  if systemctl is-active -q auditd; then systemctl reload auditd || true; else systemctl start auditd || true; fi
   sleep 1
   if ! systemctl is-active -q auditd; then
     cp -p "$conf.legion-prev" "$conf"
-    systemctl restart auditd || true
+    systemctl start auditd || true
     warn "auditd did not start with the new settings; its previous settings are back"
   fi
   rm -f "$conf.legion-prev"
@@ -1518,9 +1561,9 @@ Wants=network-online.target
 After=network-online.target
 [Service]
 # Sandboxed (Legion tamper protection): system and home folders read-only,
-# no privilege gain, private /tmp, kernel settings read-only.
+# no privilege gain, kernel settings read-only.
 NoNewPrivileges=yes
-PrivateTmp=yes
+# No private /tmp: the scan must see the real /tmp, /var/tmp and /dev/shm.
 ProtectSystem=full
 ProtectHome=read-only
 ProtectKernelTunables=yes
@@ -1549,6 +1592,294 @@ EOF
     warn "YARA rules could not be downloaded now; the weekly scan retries first"
   fi
   systemctl enable --now legion-yara-scan.timer
+}
+
+step_sigma() {
+  # Threat detection: every 15 minutes the new audit events are checked
+  # against the Sigma rules for Linux audit logs (SigmaHQ), with Zircolite.
+  # Each alert names the user, the program and the command, and the program
+  # (or the file it wrote) is scanned with YARA. Alerts go to the system log,
+  # so they reach the log server too, and to /var/log/legion/sigma-alerts.log.
+  local ver=4.7.1 dir=/opt/legion/zircolite zip_arch sha tmp
+  case "$ARCH" in
+    x86_64) zip_arch=x64 sha=f09d3ba377ef0bf4899bba71b63ffca38d714f71765a716e46ad3549da5e316a ;;
+    aarch64) zip_arch=arm64 sha=9c76c902a5d0709d67a1c3176bfa30b50d14950ae7fae5122c2b96341dbb28ed ;;
+    *) warn "Zircolite has no build for $ARCH; skipping threat detection"; return 0 ;;
+  esac
+  apt-get "${APT[@]}" install curl unzip python3
+  install -d -m 755 /opt/legion
+  install -d -m 700 "$STATE/sigma"
+  [ -d /etc/legion ] || install -d -m 755 /etc/legion
+  if [ "$(cat "$dir/VERSION" 2>/dev/null)" != "$ver" ]; then
+    tmp="$(mktemp -d)"
+    # A pinned release, checked against its published SHA-256 before use.
+    if ! curl -fsSL --retry 3 -o "$tmp/z.zip" \
+      "https://github.com/wagga40/Zircolite/releases/download/v$ver/Zircolite-$ver-linux-$zip_arch.zip"; then
+      rm -rf "$tmp"; echo "could not download Zircolite $ver" >&2; return 1
+    fi
+    if ! echo "$sha  $tmp/z.zip" | sha256sum -c --quiet; then
+      rm -rf "$tmp"; echo "Zircolite download does not match its checksum; not installed" >&2; return 1
+    fi
+    unzip -q "$tmp/z.zip" -d "$tmp/x"
+    rm -rf "$dir.new"
+    mv "$tmp/x/Zircolite-$ver-linux-$zip_arch" "$dir.new"
+    echo "$ver" >"$dir.new/VERSION"
+    chown -R root:root "$dir.new"
+    chmod -R go-w "$dir.new"
+    rm -rf "$dir"
+    mv "$dir.new" "$dir"
+    rm -rf "$tmp"
+  fi
+  # Only the rules written for Linux audit logs, medium level and up: the
+  # others need sensors this device does not have, and low-level rules flag
+  # everyday admin commands.
+  python3 -I - "$dir/rules/rules_linux.json" "$STATE/sigma/rules.json" <<'PY'
+import json, sys
+rules = json.load(open(sys.argv[1]))
+keep = [r for r in rules
+        if r.get("logsource", {}).get("service") == "auditd"
+        and r.get("level") in ("medium", "high", "critical")]
+json.dump(keep, open(sys.argv[2], "w"))
+print(len(keep), "rules")
+PY
+  chmod 600 "$STATE/sigma/rules.json"
+  [ -f /etc/legion/sigma-ignore ] || cat >/etc/legion/sigma-ignore <<'EOF'
+# Sigma rules to ignore on this device, one rule title per line, exactly as
+# it appears in /var/log/legion/sigma-alerts.log. Lines starting with # are
+# ignored. Example:
+# Unix Shell Configuration Modification
+EOF
+  cat >/usr/local/sbin/legion-sigma-scan <<'EOF'
+#!/usr/bin/env bash
+# Checks the audit events since the last check against the Sigma rules.
+#   legion-sigma-scan                 check new events (run by the timer)
+#   legion-sigma-scan --mark-reviewed skip everything logged so far
+# Exits 1 when there are new alerts, so the systemd unit shows as failed.
+set -uo pipefail
+umask 027
+export LC_ALL=C.UTF-8
+DIR=/var/lib/legion/sigma
+ZIRC=/opt/legion/zircolite/Zircolite
+[ -s /var/log/audit/audit.log ] || { echo "no audit log yet"; exit 0; }
+search() { ausearch --input-logs --checkpoint "$DIR/checkpoint" --raw "$@" 2>/dev/null; }
+if [ "${1:-}" = --mark-reviewed ]; then
+  search >/dev/null
+  rc=$?
+  [ "$rc" -lt 10 ] || { rm -f "$DIR/checkpoint"; search >/dev/null; }
+  exit 0
+fi
+# Legion's own runs change watched files on purpose. Skip while it runs; at
+# the end of a run Legion marks its own changes as reviewed.
+flock -n /run/legion.lock true || { echo "Legion is running; checking next time"; exit 0; }
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+search >"$work/events.log"
+rc=$?
+if [ "$rc" -ge 10 ]; then
+  # The checkpoint is damaged or its event was rotated away: start over from
+  # the last few minutes rather than read every log again.
+  rm -f "$DIR/checkpoint"
+  search -ts recent >"$work/events.log"
+fi
+date -u +%FT%TZ >"$DIR/last"
+[ -s "$work/events.log" ] || exit 0
+cd "$work" || exit 2
+if ! "$ZIRC" --auditd -e "$work/events.log" -r "$DIR/rules.json" -o "$work/found.json" -q >"$work/zircolite.out" 2>&1; then
+  echo "Zircolite failed:" >&2; tail -n 20 "$work/zircolite.out" >&2; exit 2
+fi
+[ -s "$work/found.json" ] || exit 0
+exec python3 -I /usr/local/lib/legion/sigma-alerts.py "$work/events.log" "$work/found.json"
+EOF
+  install -d -m 755 /usr/local/lib/legion
+  cat >/usr/local/lib/legion/sigma-alerts.py <<'EOF'
+"""Turns Zircolite matches into Legion alerts: adds the user, program and
+command from the same audit event, scans the program or file with YARA, and
+writes each alert to the system log and to /var/log/legion/sigma-alerts.log.
+Exits 1 when there is at least one new alert."""
+import calendar, json, os, pwd, re, subprocess, sys, syslog, time
+
+events_file, found_file = sys.argv[1], sys.argv[2]
+LOG = "/var/log/legion/sigma-alerts.log"
+YARA_RULES = "/var/lib/legion/yara/rules.yarc"
+# Package installs and updates change watched files as part of their job.
+PACKAGE_TOOLS = {"/usr/bin/dpkg", "/usr/bin/apt", "/usr/bin/apt-get", "/usr/lib/snapd/snapd",
+                 "/usr/bin/snap", "/usr/libexec/packagekitd", "/usr/libexec/fwupd/fwupd"}
+FIELD = re.compile(r'(\w+)=("[^"]*"|\S+)')
+SERIAL = re.compile(r"msg=audit\((\d+)\.\d+:(\d+)\)")
+
+def fields(line):
+    out = {}
+    for k, v in FIELD.findall(line):
+        if v.startswith('"'):
+            v = v[1:-1]
+        elif (k.startswith("a") and k[1:].isdigit() and line.startswith("type=EXECVE ")) or k == "proctitle":
+            try:  # arguments with spaces are logged as hex
+                v = bytes.fromhex(v).decode(errors="replace").replace("\0", " ")
+            except ValueError:
+                pass
+        out[k] = v
+    return out
+
+lines = open(events_file, errors="replace").read().splitlines()
+calls, commands, records = {}, {}, {}
+for line in lines:
+    m = SERIAL.search(line)
+    if not m:
+        continue
+    rtype = line[5:line.find(" ")]
+    # Zircolite drops underscores from field names (cap_fp becomes capfp).
+    records.setdefault(rtype, []).append(({k.replace("_", ""): v for k, v in fields(line).items()}, m.group(1), m.group(2)))
+    if line.startswith("type=SYSCALL "):
+        calls.setdefault(m.group(2), {}).update(fields(line))
+    elif line.startswith("type=CWD "):
+        calls.setdefault(m.group(2), {})["cwd"] = fields(line).get("cwd", "")
+    elif line.startswith("type=EXECVE "):
+        f = fields(line)
+        commands[m.group(2)] = " ".join(f.get(f"a{i}", "") for i in range(int(f.get("argc", 0) or 0)))
+
+# Time windows of Legion's own runs: its changes are not attacks.
+quiet = []
+try:
+    for l in open("/var/lib/legion/sigma/quiet"):
+        a, b = l.split()
+        quiet.append((int(a), int(b)))
+except (OSError, ValueError):
+    pass
+
+# Zircolite reports the matching record's fields; find that record in the
+# input to learn its audit event (and so the program, user and command).
+SKIP = {"row_id", "OriginalLogfile", "host", "timestamp", "type"}
+def locate(m):
+    want = {k.replace("_", ""): str(v) for k, v in m.items() if k not in SKIP and v not in (None, "")}
+    try:  # Zircolite's timestamp is the event time in UTC, to the second
+        sec = str(calendar.timegm(time.strptime(m.get("timestamp", ""), "%Y-%m-%d %H:%M:%S")))
+    except ValueError:
+        sec = None
+    best, best_score = (None, None), 0
+    for f, epoch, serial in records.get(m.get("type", ""), []):
+        score = sum(f.get(k) == v for k, v in want.items())
+        if score == len(want):
+            return epoch, serial
+        # A field Zircolite reformatted: take the closest record of that second.
+        if sec == epoch and score > best_score and score >= 0.7 * len(want):
+            best, best_score = (epoch, serial), score
+    return best
+
+ignore = set()
+try:
+    for t in open("/etc/legion/sigma-ignore"):
+        t = t.strip()
+        if t and not t.startswith("#"):
+            ignore.add(t)
+except OSError:
+    pass
+
+def user(uid):
+    try:
+        return pwd.getpwuid(int(uid)).pw_name
+    except (ValueError, KeyError):
+        return "unset" if uid in ("4294967295", "-1") else uid
+
+def yara(path):
+    if not os.path.exists(YARA_RULES):
+        return "YARA not set up"
+    if not path or not os.path.isfile(path):
+        return "no file to scan"
+    if os.path.getsize(path) > 64 * 1024 * 1024:
+        return "file over 64 MB, not scanned"
+    r = subprocess.run(["yara", "-C", "-w", "-N", YARA_RULES, path], capture_output=True, text=True)
+    if r.returncode != 0:
+        return "YARA failed: " + r.stderr.strip()[:200]
+    hits = sorted({l.split()[0] for l in r.stdout.splitlines() if l.strip()})
+    return "YARA match: " + ", ".join(hits) if hits else "YARA: no match"
+
+alerts, seen = [], set()
+for d in json.load(open(found_file)):
+    title = d.get("title", "")
+    if title in ignore:
+        continue
+    for m in d.get("matches", []):
+        epoch, serial = locate(m)
+        if serial is None:
+            serial = "row " + str(m.get("row_id"))
+        elif any(a <= int(epoch) <= b for a, b in quiet):
+            continue
+        if (title, serial) in seen:
+            continue
+        seen.add((title, serial))
+        call = calls.get(serial, {})
+        exe = call.get("exe", m.get("exe", ""))
+        if exe in PACKAGE_TOOLS:
+            continue
+        target = m.get("name") if m.get("type") == "PATH" else exe
+        if target and not target.startswith("/") and call.get("cwd"):
+            target = os.path.join(call["cwd"], target)
+        alerts.append({
+            "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(epoch))) if epoch else m.get("timestamp"),
+            "level": d.get("rule_level", ""),
+            "rule": title,
+            "rule_id": d.get("id", ""),
+            "attack": [t for t in d.get("tags", []) if t.startswith("attack.")],
+            "user": user(call.get("auid", "")),
+            "runs_as": user(call.get("euid", "")),
+            "program": exe,
+            "command": commands.get(serial, ""),
+            "file": m.get("name", "") if m.get("type") == "PATH" else "",
+            "pid": call.get("pid", ""),
+            "audit_event": serial,
+            "yara": yara(target),
+        })
+
+if not alerts:
+    sys.exit(0)
+syslog.openlog("legion-sigma", 0, syslog.LOG_AUTHPRIV)
+with open(LOG, "a") as f:
+    for a in alerts:
+        f.write(json.dumps(a) + "\n")
+        prio = syslog.LOG_CRIT if a["level"] in ("high", "critical") or a["yara"].startswith("YARA match") else syslog.LOG_WARNING
+        what = a["command"] or a["file"] or a["program"]
+        syslog.syslog(prio, f'Sigma alert ({a["level"]}): {a["rule"]}; user {a["user"]}, '
+                            f'program {a["program"]}, {what}; {a["yara"]}')
+        print(f'{a["time"]} {a["level"]}: {a["rule"]} | {a["user"]} | {what} | {a["yara"]}')
+sys.exit(1)
+EOF
+  chmod 750 /usr/local/sbin/legion-sigma-scan
+  chmod 644 /usr/local/lib/legion/sigma-alerts.py
+  touch "$LOGDIR/sigma-alerts.log"
+  chmod 640 "$LOGDIR/sigma-alerts.log"
+  cat >/etc/systemd/system/legion-sigma-scan.service <<'EOF'
+[Unit]
+Description=Check new audit events against the Sigma rules
+After=auditd.service
+[Service]
+# Sandboxed (Legion tamper protection): system and home folders read-only,
+# no privilege gain, kernel settings read-only.
+NoNewPrivileges=yes
+# No private /tmp: dropped tools land in /tmp, /var/tmp and /dev/shm.
+ProtectSystem=full
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+Type=oneshot
+Nice=10
+IOSchedulingClass=idle
+MemoryHigh=1G
+ExecStart=/usr/local/sbin/legion-sigma-scan
+EOF
+  cat >/etc/systemd/system/legion-sigma-scan.timer <<'EOF'
+[Unit]
+Description=Check new audit events against the Sigma rules every 15 minutes
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+AccuracySec=1min
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now legion-sigma-scan.timer
+  info "Zircolite $ver, $(python3 -I -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' "$STATE/sigma/rules.json") Sigma rules for audit logs"
 }
 
 step_integrity() {
@@ -2053,7 +2384,10 @@ if [ "$READONLY" = 0 ]; then
   [ "$TOOLS" = 0 ] || run_step "Tools: audit, secrets, backups, Terraform, Trivy" step_tools
   run_step "Audit logging (auditd)" step_audit
   run_step "Log forwarding to a log server" step_forward
+  [ "$SIGMA" = 0 ] || run_step "Threat detection: Sigma rules on audit events, every 15 minutes" step_sigma
   run_step "Compliance: daily check, weekly vulnerability scan" step_compliance
+  # Legion's own changes in this run are not attacks.
+  [ ! -x /usr/local/sbin/legion-sigma-scan ] || /usr/local/sbin/legion-sigma-scan --mark-reviewed >/dev/null 2>&1 || true
   # Legion's own later steps change files AIDE watches; accept them (logged in
   # integrity.log) so the next daily check does not report them.
   if [ -x /usr/local/sbin/legion-aide-baseline ] && [ -f "$STATE/aide/aide.db" ]; then
@@ -2122,12 +2456,16 @@ c_firewall() {
   grep -q 'Status: active' <<<"$out" && grep -q 'deny (incoming)' <<<"$out" && return 0
   NOTE="firewall off or not blocking incoming connections"; return 1
 }
-c_auditd() { in_container && return 2; systemctl is-active -q auditd && return 0; NOTE="auditd not running"; return 1; }
+c_auditd() {
+  in_container && return 2
+  systemctl is-active -q auditd || { NOTE="auditd not running"; return 1; }
+  [ "$(systemctl show -p RefuseManualStop --value auditd)" = yes ] || { NOTE="auditd can be stopped by hand (run Legion again)"; return 1; }
+}
 c_audit_rules() {
   in_container && return 2
   local r k
   r="$(auditctl -l 2>/dev/null)"
-  for k in identity privilege user_emulation session logins system-locale time modules perm_mod access mounts delete MAC-policy privileged legion-tamper; do
+  for k in identity privilege user_emulation session logins system-locale time modules perm_mod access mounts delete MAC-policy privileged legion-tamper exec persistence audit-log; do
     # auditctl -l shows file watches as "-k NAME" and syscall rules as "key=NAME".
     grep -qE -- "(-k |key=)$k( |$)" <<<"$r" || { NOTE="audit rules for '$k' not loaded"; return 1; }
   done
@@ -2164,6 +2502,27 @@ c_yara() {
     NOTE="YARA scan not set up (run Legion without --no-yara)"; return 1
   fi
   ! last_run_failed legion-yara-scan.service || { NOTE="the last YARA scan found something; see /var/log/legion/yara-scan.log"; return 1; }
+}
+c_sigma() {
+  if ! systemctl is-enabled -q legion-sigma-scan.timer 2>/dev/null || [ ! -x /opt/legion/zircolite/Zircolite ]; then
+    NOTE="threat detection not set up (run Legion without --no-sigma)"; return 1
+  fi
+  local n
+  n="$(python3 -I -c '
+import json, sys, time
+cut = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 7 * 86400))
+n = 0
+try:
+    for line in open(sys.argv[1]):
+        try:
+            n += json.loads(line).get("time", "") >= cut
+        except ValueError:
+            pass
+except OSError:
+    pass
+print(n)' "$LOGDIR/sigma-alerts.log")"
+  [ "${n:-0}" = 0 ] || { NOTE="$n threat alerts in the last 7 days; see $LOGDIR/sigma-alerts.log"; return 1; }
+  ! last_run_failed legion-sigma-scan.service || { NOTE="the last Sigma check failed; see systemctl status legion-sigma-scan"; return 1; }
 }
 c_integrity() {
   if ! systemctl is-enabled -q legion-integrity.timer 2>/dev/null || [ ! -f "$STATE/aide/aide.db" ]; then
@@ -2504,6 +2863,7 @@ CHECKS=(
   "time-sync|Clock synchronized|c_time|CC7.2|164.312(b)|AU-8|3.3.7"
   "clamav|ClamAV updates and weekly scan|c_clamav|CC6.8|164.308(a)(5)(ii)(B)|SI-3|3.14.2"
   "yara|YARA weekly scan|c_yara|CC6.8|164.308(a)(5)(ii)(B)|SI-3|3.14.5"
+  "sigma|Threat detection: Sigma rules on audit events|c_sigma|CC7.2|164.308(a)(1)(ii)(D)|SI-4|3.14.6"
   "integrity|Daily file integrity check|c_integrity|CC7.1|164.312(c)(1)|SI-7|-"
   "secure-boot|Secure Boot|c_secureboot|CC6.8|-|SI-7(9)|-"
   "apparmor|AppArmor confinement|c_apparmor|CC6.8|-|AC-3(3)|-"
@@ -2635,7 +2995,7 @@ make_bundle() {
   cp "$LOGDIR"/compliance-report.* "$b/reports/" 2>/dev/null || true
   cp "$LOGDIR"/cis-scap-report.html "$b/reports/" 2>/dev/null || true
   [ ! -s "$RUNLOG" ] || cp "$RUNLOG" "$b/logs/"
-  for f in yara-scan.log integrity.log vuln-scan.txt privileged-programs.txt; do [ ! -f "$LOGDIR/$f" ] || tail -n 2000 "$LOGDIR/$f" >"$b/logs/$f"; done
+  for f in yara-scan.log integrity.log vuln-scan.txt privileged-programs.txt sigma-alerts.log; do [ ! -f "$LOGDIR/$f" ] || tail -n 2000 "$LOGDIR/$f" >"$b/logs/$f"; done
   cp "$LOGDIR"/vuln-report.html "$b/reports/" 2>/dev/null || true
   for f in /etc/audit/rules.d/legion.rules /etc/systemd/journald.conf.d/legion.conf \
     /etc/security/pwquality.conf.d/legion.conf /etc/sysctl.d/60-legion-hardening.conf \
@@ -2645,7 +3005,8 @@ make_bundle() {
     /etc/login.defs /etc/default/useradd /etc/profile.d/legion-session.sh /etc/sudoers.d/legion \
     /etc/security/limits.d/legion.conf /etc/systemd/coredump.conf.d/legion.conf /etc/modprobe.d/legion-filesystems.conf \
     /etc/ssh/sshd_config.d/00-legion.conf /etc/audit/auditd.conf /etc/gdm3/greeter.dconf-defaults \
-    /etc/dconf/db/local.d/00-legion-media /etc/audit/rules.d/99-legion-lock.rules /etc/rsyslog.d/60-legion-forward.conf; do
+    /etc/dconf/db/local.d/00-legion-media /etc/audit/rules.d/99-legion-lock.rules /etc/rsyslog.d/60-legion-forward.conf \
+    /etc/legion/sigma-ignore /etc/systemd/system/auditd.service.d/legion.conf; do
     [ ! -f "$f" ] || cp "$f" "$b/settings/$(echo "${f#/}" | tr / _)"
   done
   {
@@ -2728,6 +3089,14 @@ fi
 if [ "$READONLY" = 1 ]; then
   [ "$CHECK" = 1 ] && [ "$REPORT_ONLY" = 0 ] && [ "$FAILS" -gt 0 ] && exit 1
   exit 0
+fi
+
+# Legion's own changes in this run are not attacks. The Sigma check skips
+# events from this time window; auditd may write the last ones to disk a
+# little later, so the window runs a few seconds past the end.
+if [ -d "$STATE/sigma" ]; then
+  echo "$LEGION_START $(($(date +%s) + 10))" >>"$STATE/sigma/quiet"
+  tail -n 50 "$STATE/sigma/quiet" >"$STATE/sigma/quiet.new" && mv -f "$STATE/sigma/quiet.new" "$STATE/sigma/quiet"
 fi
 
 section "Result"

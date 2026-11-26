@@ -17,7 +17,8 @@ CIS and DISA STIG have not published benchmarks for Ubuntu 26.04 yet. Until they
 - Login banner, and a screen lock after 10 minutes that users cannot turn off. The login screen asks for the user name instead of listing users
 - Passwords: 12+ characters and 3 character types, the last 24 cannot be reused, and they expire every 90 days. An account is disabled 45 days after its password expires
 - Sessions: idle console and SSH sessions end after 15 minutes, new files are private to their owner (umask 027), sudo asks for the password again after 15 minutes, and only root can use su
-- Audit logging: the CIS set of audit rules. Changes to accounts, sudo and settings, logins, refused file access, permission changes, deletions, mounts, kernel modules and every use of a privileged program. You get an alert when the audit log disk runs low
+- Audit logging: the CIS set of audit rules. Changes to accounts, sudo and settings, logins, refused file access, permission changes, deletions, mounts, kernel modules and every use of a privileged program, plus every command people run and changes to the files attackers use to start code at login. You get an alert when the audit log disk runs low
+- Threat detection: every 15 minutes the new audit events are checked against the Sigma rules for Linux audit logs (SigmaHQ, run with Zircolite). Each alert names the user, the program and the command, and the program or file involved is scanned with YARA right away. Alerts go to the system log (and so to your log server) and to `/var/log/legion/sigma-alerts.log`
 - Log retention: keeps system logs for 1 year
 - Log forwarding (optional): sends a copy of system and audit logs to your log server over syslog, with TLS if you want it. Logs wait on disk while the server is unreachable
 - Audit lock (optional): the audit rules cannot be changed or turned off, even by root, until the next restart
@@ -69,11 +70,13 @@ Run `bash legion.sh --help` for all options. It is safe to run again.
 
 - Compliance report: `/var/log/legion/compliance-report.md` (and `.json`)
 - Evidence bundles: `/var/log/legion/evidence/`, each with a SHA-256 checksum
-- Scan results: `/var/log/legion/yara-scan.log` and `integrity.log`
+- Scan results: `/var/log/legion/yara-scan.log`, `integrity.log` and `sigma-alerts.log`
 
-A ClamAV, YARA, integrity or daily compliance finding marks its service as failed. Check with `systemctl --failed`.
+A ClamAV, YARA, Sigma, integrity or daily compliance finding marks its service as failed. Check with `systemctl --failed`.
 
 Package updates are accepted into the integrity baseline automatically. Any other change to watched files stays reported in `/var/log/legion/integrity.log` until you review it and accept it with `sudo legion-aide-baseline manual`.
+
+If a Sigma rule keeps flagging something that is normal on your device, add the rule's title (as shown in `sigma-alerts.log`) to `/etc/legion/sigma-ignore`. Changes made by package installs and by Legion's own runs are not reported.
 
 ## If you get locked out
 
@@ -116,6 +119,8 @@ It keeps installed updates, Ubuntu Pro and your logs. Add `--remove-packages`, `
 - Files you create are no longer readable by other users. Commands run with sudo keep Ubuntu's usual permissions, so software installed with sudo still works for everyone.
 - Some filesystems are blocked: hfs and hfsplus (Mac drives), udf (DVDs and some USB drives), cramfs, freevxfs and jffs2. USB drives formatted as FAT, exFAT or NTFS work as usual.
 - Log forwarding sends standard syslog over TCP or TLS, which most log servers and SIEMs accept. Services that only take HTTP uploads or a cloud resource ID need their vendor's own agent.
+- Recording every command makes the audit log grow faster on a busy desktop. Legion keeps 20 audit files of 32 MB and rotates the oldest out; with log forwarding, the log server keeps the full history.
+- Threat detection uses a pinned Zircolite release, checked against its published SHA-256 before it is installed. `--no-sigma` skips it.
 - If the audit rules are locked, removing Legion leaves them active until the next restart.
 - sudo-rs, Ubuntu 26.04's sudo, has no separate log file. sudo use is recorded in the system journal and by the audit rules.
 - Earlier versions of Legion installed the Postfix mail server as a side effect of installing AIDE. Legion now sets Postfix to accept connections from this device only. If nothing on your machine sends mail, you can remove it: `sudo apt purge postfix bsd-mailx`.

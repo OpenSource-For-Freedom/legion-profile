@@ -10,8 +10,23 @@ D=/root/legion-test
 mkdir -p "$D"
 L=/home/legion/legion
 PW=Correct-Horse-9x
-KEYS="identity privilege user_emulation session logins system-locale time modules perm_mod access mounts delete MAC-policy privileged legion-tamper"
+KEYS="identity privilege user_emulation session logins system-locale time modules perm_mod access mounts delete MAC-policy privileged legion-tamper exec persistence audit-log"
 SYSCTLS="kernel.kptr_restrict kernel.dmesg_restrict fs.suid_dumpable net.ipv4.conf.all.accept_redirects net.ipv4.conf.all.send_redirects net.ipv4.conf.all.secure_redirects net.ipv4.icmp_echo_ignore_broadcasts net.ipv6.conf.all.accept_redirects"
+ALERTS=/var/log/legion/sigma-alerts.log
+# Runs the Sigma check now, through its sandboxed service, and prints the
+# alerts it added.
+sigma_check() {
+  local before
+  before="$(wc -l <"$ALERTS" 2>/dev/null || echo 0)"
+  systemctl start legion-sigma-scan.service
+  echo "      Sigma check: $(systemctl show -p Result --value legion-sigma-scan.service), $(($(wc -l <"$ALERTS") - before)) new alerts"
+  tail -n +"$((before + 1))" "$ALERTS" | python3 -c '
+import json, sys
+for l in sys.stdin:
+    a = json.loads(l)
+    print("        " + a["level"] + ": " + a["rule"] + " | " + a["user"] + " | " + (a["command"] or a["file"] or a["program"])[:80] + " | " + a["yara"])'
+  tail -n +"$((before + 1))" "$ALERTS" >"$D/alerts.new"
+}
 rules_loaded() { auditctl -l 2>/dev/null | grep -vc '^No rules'; }
 apt_get() { DEBIAN_FRONTEND=noninteractive apt-get -y -q -o DPkg::Lock::Timeout=900 "$@"; }
 # Logins through PAM, the way each program asks: the login screen, the text
@@ -21,7 +36,7 @@ pam_logins() {
   t "PAM: console login $1" bash -c "echo $PW | pamtester login legion authenticate acct_mgmt"
   t "PAM: sudo with a password $1" bash -c "echo $PW | pamtester sudo legion authenticate acct_mgmt"
   t "boot finished with no failed services, except scan findings $1" bash -c '
-    s="$(systemctl is-system-running --wait)"; [ "$s" = running ] || [ -z "$(systemctl --failed --no-legend --plain | grep -vE "legion-vuln-scan|clamscan|legion-yara")" ]'
+    s="$(systemctl is-system-running --wait)"; [ "$s" = running ] || [ -z "$(systemctl --failed --no-legend --plain | grep -vE "legion-vuln-scan|clamscan|legion-yara|legion-sigma")" ]'
   t "login screen (GDM) running $1" systemctl is-active -q gdm
   systemctl --failed --no-legend --plain | sed 's/^/      failed unit: /'
   echo "      boot time: $(systemd-analyze 2>/dev/null | head -n 1)"
@@ -88,6 +103,22 @@ case "$1" in
       for u in legion-integrity legion-check; do systemctl start $u.service; r=$(systemctl show -p Result --value $u.service); [ "$r" = success ] || { echo "$u $r"; exit 1; }; done'
     t "kernel settings applied" bash -c '[ "$(sysctl -n kernel.kptr_restrict)" = 2 ] && [ "$(sysctl -n net.ipv4.conf.all.accept_redirects)" = 0 ]'
     t "blocked filesystem cannot be loaded (hfsplus)" bash -c "! modprobe hfsplus"
+    echo "      simulated attack, as the user legion: a program run from /tmp, chmod 777,"
+    echo "      insmod, and /etc/ld.so.preload created with sudo"
+    cp /bin/true /tmp/evil-test
+    printf '%s\n' 'X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*' >>/tmp/evil-test
+    chmod 755 /tmp/evil-test
+    su - legion -c '/tmp/evil-test; touch /tmp/f; chmod 777 /tmp/f; sudo -n insmod /nonexistent.ko; sudo -n touch /etc/ld.so.preload; sudo -n rm -f /etc/ld.so.preload; rm -f /tmp/f' >/dev/null 2>&1
+    sleep 2
+    sigma_check
+    for r in "Program Executions in Suspicious Folders" "Suspicious Commands Linux" "Loading of Kernel Module via Insmod" "Modification of ld.so.preload"; do
+      t "Sigma alert for the attack: $r" grep -q "\"rule\": \"$r\"" "$D/alerts.new"
+    done
+    t "alerts name the real user (legion), even through sudo" bash -c "grep 'insmod' $D/alerts.new | grep -q '\"user\": \"legion\"'"
+    t "the program from /tmp was scanned with YARA" bash -c "grep evil-test $D/alerts.new | grep -q '\"yara\": \"YARA'"
+    t "Sigma alerts reach the log server" bash -c "sleep 3; grep -q 'Sigma alert' $D/received.log"
+    rm -f /tmp/evil-test
+    systemctl reset-failed legion-sigma-scan.service
     LEGION_NO_ANIM=1 /usr/local/sbin/legion --report-only >"$D/report.log" 2>&1
     t "report: audit lock and log forwarding pass" bash -c "grep -q '✔ Audit rules locked until restart' $D/report.log && grep -q '✔ Logs copied to a log server' $D/report.log"
     grep '✖' "$D/report.log" | sed 's/^/      report: /'
@@ -103,6 +134,10 @@ case "$1" in
     : >"$D/received.log"; logger -t legion-test "after restart $2"; sleep 5
     t "log forwarding works after restart" grep -q "after restart $2" "$D/received.log"
     pam_logins "(after restart $2)"
+    sigma_check
+    t "no Sigma alerts from restarts and logins (false alarms)" test ! -s "$D/alerts.new"
+    systemctl reset-failed legion-sigma-scan.service 2>/dev/null
+    echo "      audit log: $(du -sh /var/log/audit | cut -f1), $(grep -c 'key="exec"' /var/log/audit/audit.log) commands recorded"
     t "screen lock enforced for legion" bash -c "[ \"\$(su - legion -c 'dconf read /org/gnome/desktop/screensaver/lock-enabled')\" = true ]"
     t "login screen hides user names" grep -q 'disable-user-list=true' /etc/gdm3/greeter.dconf-defaults
     ;;
@@ -121,6 +156,7 @@ case "$1" in
     grep '✖' "$D/rm.log" | sed 's/^/      /'
     t "removal says a restart is needed for the locked rules" grep -q 'locked audit rules stay active' "$D/rm.log"
     t "forwarding stopped" test ! -e /etc/rsyslog.d/60-legion-forward.conf
+    t "threat detection removed" bash -c "[ ! -e /opt/legion ] && [ ! -e /etc/systemd/system/legion-sigma-scan.timer ]"
     for k in $SYSCTLS; do echo "$k=$(sysctl -n "$k")"; done >"$D/sysctl.after"
     t "kernel settings back to before" diff "$D/sysctl.before" "$D/sysctl.after"
     diff "$D/sysctl.before" "$D/sysctl.after" | sed 's/^/      /'

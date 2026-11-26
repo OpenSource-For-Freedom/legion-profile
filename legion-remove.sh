@@ -176,6 +176,13 @@ fi
 
 section "Scheduled scans and checks"
 undo "YARA weekly scan removed" bash -c "$(declare -f unit_off); unit_off legion-yara-scan.timer legion-yara-scan.service; rm -f /usr/local/sbin/legion-yara-update /usr/local/sbin/legion-yara-scan"
+if [ -s /var/lib/legion/created-dirs ]; then
+  # Empty folders Legion created in home folders so they could be watched;
+  # anything put in them since is kept.
+  # shellcheck disable=SC2016 # expanded by the inner shell
+  undo "empty watched folders in home folders removed" bash -c 'tac /var/lib/legion/created-dirs | while read -r d; do rmdir "$d" 2>/dev/null || true; done; rm -f /var/lib/legion/created-dirs'
+fi
+undo "threat detection removed (Sigma rules and Zircolite)" bash -c "$(declare -f unit_off); unit_off legion-sigma-scan.timer legion-sigma-scan.service; rm -f /usr/local/sbin/legion-sigma-scan /usr/local/lib/legion/sigma-alerts.py /etc/legion/sigma-ignore; rm -rf /opt/legion/zircolite /opt/legion/zircolite.new /var/lib/legion/sigma; rmdir /usr/local/lib/legion /opt/legion 2>/dev/null || true"
 undo "integrity check removed (AIDE and package checks)" bash -c "$(declare -f unit_off); unit_off legion-integrity.timer legion-integrity.service; rm -f /usr/local/sbin/legion-aide-baseline /usr/local/sbin/legion-integrity-check /etc/apt/apt.conf.d/99legion-aide; rm -rf /etc/legion"
 # Ubuntu's own AIDE timer goes back to how it was before Legion. Older Legion
 # versions did not record that; then it is turned on only if Ubuntu's AIDE
@@ -231,6 +238,9 @@ elif [ -e "$B/20auto-upgrades.absent" ]; then
 fi
 AUDIT_LOCKED=0
 ! in_container && auditctl -s 2>/dev/null | grep -qx 'enabled 2' && AUDIT_LOCKED=1
+if [ -f /etc/systemd/system/auditd.service.d/legion.conf ]; then
+  undo "auditd can be stopped by hand again (Ubuntu default)" bash -c 'rm -f /etc/systemd/system/auditd.service.d/legion.conf; rmdir /etc/systemd/system/auditd.service.d 2>/dev/null; systemctl daemon-reload'
+fi
 undo "audit rules removed" rm -f /etc/audit/rules.d/legion.rules /etc/audit/rules.d/soc2.rules /etc/audit/rules.d/99-legion-lock.rules /usr/local/sbin/legion-audit-alert
 if [ -f /etc/rsyslog.d/60-legion-forward.conf ]; then
   undo "log forwarding to the log server stopped" bash -c 'rm -f /etc/rsyslog.d/60-legion-forward.conf && systemctl try-restart rsyslog'

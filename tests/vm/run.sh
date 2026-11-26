@@ -5,7 +5,10 @@
 # Needs Docker and /dev/kvm. Nothing on this machine is changed; the cloud
 # image is cached in ~/.cache/legion-vm.
 #
-#   bash tests/vm/run.sh
+#   bash tests/vm/run.sh             full test with the desktop and restarts
+#   bash tests/vm/run.sh --sensors   compare auditd, Laurel and Sysmon for Linux
+#   bash tests/vm/run.sh --attack    attack the device and check every attack left
+#                                    evidence; writes attack-report.md
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 [ -e /dev/kvm ] || { echo "no /dev/kvm: hardware virtualization is needed" >&2; exit 2; }
@@ -23,8 +26,10 @@ fi
 docker build -q -t legion-vm-runner -f tests/vm/Dockerfile tests/vm >/dev/null
 name="legion-vm-$$"
 trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
-out="${LEGION_VM_OUT:-$cache/out}"
+mode=full
+case "${1:-}" in --sensors) mode=sensors ;; --attack) mode=attack ;; esac
+out="${LEGION_VM_OUT:-$cache/out-$mode}"
 rm -rf "$out" && mkdir -p "$out"
 echo "screenshots and console log: $out"
-docker run --name "$name" --rm --device /dev/kvm -v "$cache:/cache:ro" -v "$PWD:/repo:ro" -v "$out:/out" -e HOST_UID="$(id -u)" \
+docker run --name "$name" --rm --device /dev/kvm -v "$cache:/cache:ro" -v "$PWD:/repo:ro" -v "$out:/out" -e HOST_UID="$(id -u)" -e MODE="$mode" \
   legion-vm-runner bash /repo/tests/vm/inside.sh

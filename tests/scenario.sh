@@ -71,6 +71,79 @@ t "Legion's own files and AI agent settings are watched" bash -c "grep -q -- '-k
 t "sandboxed daily check still runs" bash -c "systemctl start legion-check.service; [ \"\$(systemctl show -p Result --value legion-check.service)\" = success ]"
 t "sandboxed services are sandboxed" bash -c "systemctl show -p ProtectSystem --value legion-check.service | grep -qx full && systemctl show -p NoNewPrivileges --value legion-integrity.service | grep -qx yes"
 t "evidence bundle has the baseline checksums" bash -c "tar -xzOf \"\$(ls -t /var/log/legion/evidence/*.tar.gz | head -n 1)\" --wildcards '*/status/status.txt' | grep -q 'integrity baseline checksums'"
+echo "=== Phase 3: threat detection (Sigma rules, paired with YARA)"
+t "Zircolite installed from the pinned, checksummed release" bash -c "[ \"\$(cat /opt/legion/zircolite/VERSION)\" = 4.7.1 ] && /opt/legion/zircolite/Zircolite --help"
+t "only audit-log Sigma rules, medium level and up" python3 -c 'import json; r = json.load(open("/var/lib/legion/sigma/rules.json")); assert 15 < len(r) < 60 and all(x["logsource"]["service"] == "auditd" and x["level"] in ("medium", "high", "critical") for x in r)'
+t "Sigma check runs every 15 minutes" systemctl is-enabled -q legion-sigma-scan.timer
+t "every command people run is audited" grep -q -- '-S execve,execveat -F auid>=1000 -F auid!=unset -k exec' /etc/audit/rules.d/legion.rules
+t "ld.so.preload watched before it exists" grep -qx -- '-w /etc/ld.so.preload -p wa -k persistence' /etc/audit/rules.d/legion.rules
+# Containers cannot run auditd, so write the audit log a real attack would
+# leave: a program run from /tmp, chmod 777, and /etc/ld.so.preload created
+# through sudo; plus the same file written by dpkg, which is not an attack.
+cat >/tmp/evil-test <<'EOF'
+X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*
+EOF
+chmod 755 /tmp/evil-test
+U1000="$(getent passwd 1000 | cut -d: -f1)"
+audit_events() { # first-serial event...
+  python3 - "$(($(date +%s) + 20))" "$@" <<'EOF'
+import sys
+now, first, kinds = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3:]
+for i, kind in enumerate(kinds):
+    n = first + i
+    head = f"msg=audit({now + i}.100:{n}):"
+    def sc(exe, comm, euid=1000, sysno=59, key="exec"):
+        return (f'type=SYSCALL {head} arch=c000003e syscall={sysno} success=yes exit=0 a0=1 a1=2 a2=3 a3=0 items=2 '
+                f'ppid=100 pid={n} auid=1000 uid={euid} gid=0 euid={euid} suid=0 fsuid=0 egid=0 sgid=0 fsgid=0 '
+                f'tty=pts0 ses=3 comm="{comm}" exe="{exe}" subj=unconfined key="{key}"')
+    if kind == "tmp-exec":
+        rec = [sc("/tmp/evil-test", "evil-test"), f'type=EXECVE {head} argc=1 a0="/tmp/evil-test"', f'type=CWD {head} cwd="/tmp"']
+    elif kind == "chmod777":
+        rec = [sc("/usr/bin/chmod", "chmod"), f'type=EXECVE {head} argc=3 a0="chmod" a1="777" a2="/tmp/f"', f'type=CWD {head} cwd="/tmp"']
+    elif kind in ("preload", "dpkg-preload"):
+        exe, comm = ("/usr/bin/tee", "tee") if kind == "preload" else ("/usr/bin/dpkg", "dpkg")
+        rec = [sc(exe, comm, euid=0, sysno=257, key="persistence"), f'type=CWD {head} cwd="/root"',
+               f'type=PATH {head} item=0 name="/etc/" inode=2 dev=fc:01 mode=040755 ouid=0 ogid=0 rdev=00:00 nametype=PARENT cap_fp=0 cap_fi=0 cap_fe=0 cap_fver=0 cap_frootid=0',
+               f'type=PATH {head} item=1 name="/etc/ld.so.preload" inode=3 dev=fc:01 mode=0100644 ouid=0 ogid=0 rdev=00:00 nametype=CREATE cap_fp=0 cap_fi=0 cap_fe=0 cap_fver=0 cap_frootid=0']
+    rec.append(f'type=PROCTITLE {head} proctitle=78')
+    print("\n".join(rec))
+EOF
+}
+install -d -m 700 /var/log/audit
+audit_events 9001 tmp-exec chmod777 preload dpkg-preload >>/var/log/audit/audit.log
+/usr/local/sbin/legion-sigma-scan >/tmp/sigma.out 2>&1; rc=$?
+cat /tmp/sigma.out | sed 's/^/      /'
+A=/var/log/legion/sigma-alerts.log
+t "Sigma check raises alerts for the attack (exit $rc)" test "$rc" = 1
+for r in "Program Executions in Suspicious Folders" "Suspicious Commands Linux" "Modification of ld.so.preload"; do
+  t "alert: $r" grep -q "\"rule\": \"$r\"" "$A"
+done
+t "alert names the user, program and command" python3 -c '
+import json, sys
+a = [json.loads(l) for l in open(sys.argv[1])]
+c = [x for x in a if x["rule"] == "Suspicious Commands Linux"][0]
+assert c["user"] == sys.argv[2] and c["program"] == "/usr/bin/chmod" and c["command"] == "chmod 777 /tmp/f", c
+p = [x for x in a if x["rule"] == "Modification of ld.so.preload"][0]
+assert p["runs_as"] == "root" and p["file"] == "/etc/ld.so.preload", p' "$A" "$U1000"
+t "program from the alert scanned with YARA" python3 -c '
+import json, sys
+a = [json.loads(l) for l in open(sys.argv[1]) if "evil-test" in l][0]
+print(a["yara"]); assert a["yara"].startswith("YARA match") or a["yara"] == "YARA: no match"' "$A"
+grep -o '"yara": "[^"]*"' "$A" | sort | uniq -c | sed 's/^/      /'
+t "package manager changes not reported" bash -c "! grep -q '/usr/bin/dpkg' $A"
+t "alerts in the system log (and so on the log server)" bash -c "journalctl -t legion-sigma | grep -q 'Sigma alert (high): Modification of ld.so.preload'"
+t "alerts reach the log server" bash -c "sleep 3; grep -q 'Sigma alert' /tmp/received.log"
+n="$(wc -l <"$A")"
+t "events already checked are not reported again (sandboxed service)" bash -c "systemctl start legion-sigma-scan.service; [ \"\$(systemctl show -p Result --value legion-sigma-scan.service)\" = success ] && [ \"\$(wc -l <$A)\" = $n ]"
+echo "Suspicious Commands Linux" >>/etc/legion/sigma-ignore
+audit_events 9101 chmod777 >>/var/log/audit/audit.log
+t "rules listed in /etc/legion/sigma-ignore stay quiet" bash -c "/usr/local/sbin/legion-sigma-scan && [ \"\$(wc -l <$A)\" = $n ]"
+LEGION_NO_ANIM=1 /usr/local/sbin/legion --report-only >/tmp/rep3.log 2>&1
+t "compliance report flags the alerts" grep -q '✖ Threat detection' /tmp/rep3.log
+t "evidence bundle carries the alerts" bash -c "tar -tzf \$(ls -t /var/log/legion/evidence/*.tar.gz | head -n 1) | grep -q sigma-alerts.log"
+# Back to a quiet state for the tests that follow.
+: >"$A"; sed -i '/^Suspicious Commands Linux$/d' /etc/legion/sigma-ignore; systemctl reset-failed legion-sigma-scan.service 2>/dev/null
+rm -f /tmp/evil-test
 echo "=== Phase 1: CIS / 800-171 additions"
 day=$(( $(date +%s) / 86400 ))
 t "kit's password age: 90 days max, 1 min, 7 warn, 45 inactive" bash -c "grep -q '^kit:[^:]*:[0-9]*:1:90:7:45:' /etc/shadow"
@@ -92,7 +165,11 @@ t "media autorun off and locked" bash -c "grep -qx autorun-never=true /etc/dconf
 t "CIS audit rules generated (privileged programs, access, delete)" bash -c "grep -c -- '-k privileged' /etc/audit/rules.d/legion.rules | awk '\$1 > 5 { ok = 1 } END { exit !ok }' && grep -q 'exit=-EACCES' /etc/audit/rules.d/legion.rules && grep -q -- '-k delete' /etc/audit/rules.d/legion.rules"
 t "audit rules only use system calls the machine has" bash -c "! grep -E -- '-S [^ ]*(chown32|stime)' /etc/audit/rules.d/legion.rules | grep -q 'arch=b64'"
 t "auditd alerts when its disk runs low" grep -qx 'space_left_action = exec /usr/local/sbin/legion-audit-alert' /etc/audit/auditd.conf
-for _ in $(seq 1 120); do systemctl is-active -q legion-vuln-scan.service || break; sleep 5; done
+# A oneshot service is "activating" while it runs, not "active".
+for _ in $(seq 1 120); do
+  case "$(systemctl show -p ActiveState --value legion-vuln-scan.service)" in activating | active) sleep 5 ;; *) break ;; esac
+done
+[ -f /var/lib/legion/oval/last ] || journalctl -u legion-vuln-scan.service --no-pager | tail -n 8 | sed 's/^/      /'
 echo "vulnerability scan: $(cat /var/lib/legion/oval/last 2>/dev/null || echo 'no result') $(systemctl show -p Result --value legion-vuln-scan.service)"
 t "vulnerability scan ran and wrote its report" bash -c "test -s /var/log/legion/vuln-report.html && test -f /var/lib/legion/oval/last"
 t "report lists the new checks" bash -c "LEGION_NO_ANIM=1 bash /root/legion.sh --report-only >/tmp/rep.log 2>&1; grep -q 'Last 24 passwords cannot be reused' /tmp/rep.log && grep -q 'Setuid programs all come from packages' /tmp/rep.log"
@@ -162,6 +239,7 @@ t "sudo, SSH, session, core dump, filesystem files removed" bash -c "! ls /etc/s
 t "group legion-su deleted, su works as before" bash -c "! getent group legion-su"
 t "vulnerability scan removed" test ! -e /etc/systemd/system/legion-vuln-scan.timer
 t "SSH server still running after removal" systemctl is-active -q ssh
+t "threat detection removed" bash -c "[ ! -e /opt/legion ] && [ ! -e /etc/systemd/system/legion-sigma-scan.timer ] && [ ! -e /usr/local/sbin/legion-sigma-scan ]"
 t "audit lock and log forwarding removed" bash -c "[ ! -e /etc/audit/rules.d/99-legion-lock.rules ] && [ ! -e /etc/rsyslog.d/60-legion-forward.conf ]"
 t "IPv6 file removed" test ! -e /etc/sysctl.d/60-legion-ipv6.conf
 t "logo image removed" test ! -e /usr/local/share/legion
@@ -169,7 +247,7 @@ t "cron.yearly back to 755" test "$(stat -c %a /etc/cron.yearly)" = 755
 t "no failed units after removal" bash -c "[ -z \"\$(systemctl --failed --no-legend --plain | grep -v polkit)\" ]"
 t "second removal is clean" bash -c "bash /root/legion-remove.sh --yes"
 echo "=== removal when the login files were edited after Legion"
-LEGION_NO_ANIM=1 bash /root/legion.sh --allow-unencrypted --no-pro --no-yara --no-aide --allow-from none >/tmp/run3.log 2>&1
+LEGION_NO_ANIM=1 bash /root/legion.sh --allow-unencrypted --no-pro --no-yara --no-aide --no-sigma --allow-from none >/tmp/run3.log 2>&1
 sed -i '/# here are the per-package modules/d' /etc/pam.d/common-auth
 bash /root/legion-remove.sh --yes >/tmp/rm2.log 2>&1; rc=$?
 t "removal reports the lockout still active (exit $rc)" bash -c "[ $rc = 1 ] && grep -q 'account lockout still active' /tmp/rm2.log"
