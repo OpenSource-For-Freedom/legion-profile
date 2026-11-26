@@ -28,7 +28,16 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y -q postfix >/dev/null 2>&1; rm
 python3 -c 'import fcntl, time; f = open("/var/lib/apt/lists/lock", "w"); fcntl.lockf(f, fcntl.LOCK_EX); time.sleep(40)' &
 echo "setup: hello unpacked but not configured: $(dpkg-query -W -f '${Status}' hello 2>/dev/null)"
 echo "=== install, no terminal, --no-ipv6, bad and broad networks in --allow-from"
-LEGION_NO_ANIM=1 bash /root/legion.sh --allow-unencrypted --no-pro --no-ipv6 \
+# A log server stand-in for --forward-logs.
+python3 -c 'import socketserver
+class H(socketserver.StreamRequestHandler):
+    def handle(self):
+        with open("/tmp/received.log", "ab") as f:
+            for line in self.rfile:
+                f.write(line); f.flush()
+socketserver.ThreadingTCPServer(("127.0.0.1", 5140), H).serve_forever()' &
+LISTENER=$!
+LEGION_NO_ANIM=1 bash /root/legion.sh --allow-unencrypted --no-pro --no-ipv6 --lock-audit --forward-logs syslog://127.0.0.1:5140 \
   --allow-from 10.0.0.300/24,1.0.0.0/1,128.0.0.0/1,8.8.8.0/24,10.9.0.0/24 >/tmp/run.log 2>&1; rc=$?
 t "legion exits 0 (got $rc)" test "$rc" = 0
 grep -E "✖ \[" /tmp/run.log
@@ -51,6 +60,17 @@ t "integrity check clean right after install" bash -c "systemctl start legion-in
 t "graphical login banner compiled into GDM's settings" bash -c "printf 'file-db:/tmp/greeter-db\n' >/tmp/greeter-profile && dconf compile /tmp/greeter-db /usr/share/gdm/dconf && [ \"\$(DCONF_PROFILE=/tmp/greeter-profile dconf read /org/gnome/login-screen/banner-message-enable)\" = true ]"
 t "LEGION logo set for the login screen" bash -c "[ \"\$(DCONF_PROFILE=/tmp/greeter-profile dconf read /org/gnome/login-screen/logo)\" = \"'/usr/local/share/legion/login-logo.png'\" ]"
 t "logo readable by the temporary login-screen user" bash -c "setpriv --reuid 60578 --regid 60578 --clear-groups head -c 8 /usr/local/share/legion/login-logo.png | grep -q PNG"
+echo "=== Phase 2: tamper lockdown"
+logger -t legion-test "forwarding test message"; sleep 3
+t "log server receives system logs" grep -q 'forwarding test message' /tmp/received.log
+t "forwarding has a disk queue for offline times" grep -q 'queue.filename="legion-forward"' /etc/rsyslog.d/60-legion-forward.conf
+t "bad log server address refused, nothing changed" bash -c "! LEGION_NO_ANIM=1 bash /root/legion.sh --forward-logs 'http://x;rm' --allow-unencrypted --no-pro >/dev/null 2>&1 && grep -q 127.0.0.1 /etc/rsyslog.d/60-legion-forward.conf"
+# augenrules always moves the last "-e" line to the end of the loaded rules.
+t "audit lock rule written, and no other file sets the lock" bash -c "grep -qx -- '-e 2' /etc/audit/rules.d/99-legion-lock.rules && [ -z \"\$(grep -l '^-e' /etc/audit/rules.d/*.rules | grep -v 99-legion-lock)\" ]"
+t "Legion's own files and AI agent settings are watched" bash -c "grep -q -- '-k legion-tamper' /etc/audit/rules.d/legion.rules"
+t "sandboxed daily check still runs" bash -c "systemctl start legion-check.service; [ \"\$(systemctl show -p Result --value legion-check.service)\" = success ]"
+t "sandboxed services are sandboxed" bash -c "systemctl show -p ProtectSystem --value legion-check.service | grep -qx full && systemctl show -p NoNewPrivileges --value legion-integrity.service | grep -qx yes"
+t "evidence bundle has the baseline checksums" bash -c "tar -xzOf \"\$(ls -t /var/log/legion/evidence/*.tar.gz | head -n 1)\" --wildcards '*/status/status.txt' | grep -q 'integrity baseline checksums'"
 echo "=== Phase 1: CIS / 800-171 additions"
 day=$(( $(date +%s) / 86400 ))
 t "kit's password age: 90 days max, 1 min, 7 warn, 45 inactive" bash -c "grep -q '^kit:[^:]*:[0-9]*:1:90:7:45:' /etc/shadow"
@@ -106,7 +126,8 @@ t "lockout: admin reset unlocks" auth login Correct-Horse-9x
 t "drift check quiet when nothing changed" bash -c "/usr/local/sbin/legion --drift-only"
 echo "=== one run at a time"
 flock /run/legion.lock sleep 15 &
-sleep 1; out="$(LEGION_NO_ANIM=1 bash /root/legion.sh --report-only 2>&1)"; rc=$?; wait
+HOLDER=$!
+sleep 1; out="$(LEGION_NO_ANIM=1 bash /root/legion.sh --report-only 2>&1)"; rc=$?; wait "$HOLDER"
 t "second run at the same time refused (exit $rc)" bash -c "[ $rc = 2 ] && grep -q 'already running' <<<\"\$1\"" _ "$out"
 echo "=== NO_COLOR survives the sudo hand-off"
 cp /root/legion.sh /tmp/legion.sh && chmod 755 /tmp/legion.sh
@@ -141,6 +162,7 @@ t "sudo, SSH, session, core dump, filesystem files removed" bash -c "! ls /etc/s
 t "group legion-su deleted, su works as before" bash -c "! getent group legion-su"
 t "vulnerability scan removed" test ! -e /etc/systemd/system/legion-vuln-scan.timer
 t "SSH server still running after removal" systemctl is-active -q ssh
+t "audit lock and log forwarding removed" bash -c "[ ! -e /etc/audit/rules.d/99-legion-lock.rules ] && [ ! -e /etc/rsyslog.d/60-legion-forward.conf ]"
 t "IPv6 file removed" test ! -e /etc/sysctl.d/60-legion-ipv6.conf
 t "logo image removed" test ! -e /usr/local/share/legion
 t "cron.yearly back to 755" test "$(stat -c %a /etc/cron.yearly)" = 755
@@ -156,4 +178,5 @@ pam-auth-update --force --disable legion-faillock legion-faillock-notify >/dev/n
 bash /root/legion-remove.sh --yes >/tmp/rm3.log 2>&1; rc=$?
 t "removal finishes after the forced update (exit $rc)" test "$rc" = 0
 t "lockout really gone" bash -c "for i in 1 2 3 4 5 6; do echo w | pamtester login kit authenticate acct_mgmt; done; echo Correct-Horse-9x | pamtester login kit authenticate acct_mgmt"
+kill "$LISTENER" 2>/dev/null
 echo "RESULT: $P passed, $F failed"

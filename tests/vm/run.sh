@@ -23,5 +23,8 @@ fi
 docker build -q -t legion-vm-runner -f tests/vm/Dockerfile tests/vm >/dev/null
 name="legion-vm-$$"
 trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
-docker run --name "$name" --rm --device /dev/kvm -v "$cache:/cache:ro" -v "$PWD:/repo:ro" \
+out="${LEGION_VM_OUT:-$cache/out}"
+rm -rf "$out" && mkdir -p "$out"
+echo "screenshots and console log: $out"
+docker run --name "$name" --rm --device /dev/kvm -v "$cache:/cache:ro" -v "$PWD:/repo:ro" -v "$out:/out" -e HOST_UID="$(id -u)" \
   legion-vm-runner bash /repo/tests/vm/inside.sh

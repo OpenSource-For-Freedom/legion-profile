@@ -34,6 +34,13 @@
 #                        Legion asks when an SSH server is running
 #   --no-lockout         skip the account lockout (5 failed logins lock an
 #                        account for 30 minutes, then it unlocks by itself)
+#   --forward-logs URL   send a copy of system and audit logs to a log server
+#                        (SIEM): syslog+tls://HOST:PORT (encrypted, the
+#                        server certificate is checked) or syslog://HOST:PORT
+#   --no-forward-logs    keep logs on this device only (stops forwarding)
+#   --lock-audit         lock the audit rules until the next restart, so not
+#                        even an administrator can turn auditing off unseen
+#   --no-lock-audit      don't lock them (the default)
 #   --check              change nothing; check the device against the profile,
 #                        write the reports, exit 1 if any check fails
 #   --report-only        like --check, but always exit 0
@@ -42,7 +49,8 @@
 # After the first run Legion installs itself as `legion`, so later checks are
 # just: sudo legion --check
 #
-# Without these options Legion asks about Tailscale, private networks and IPv6.
+# Without these options Legion asks about Tailscale, private networks, IPv6,
+# log forwarding and locking the audit rules.
 # Set UBUNTU_PRO_SECRET to your Ubuntu Pro token to skip the token question.
 # Set NO_COLOR=1 for plain output, LEGION_NO_ANIM=1 to skip the animation.
 set -euo pipefail
@@ -268,6 +276,7 @@ usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' 
 ALLOW_UNENCRYPTED=0 STEAM=0 TOOLS=0 YARA=1 AIDE=1 PRO=1 LOCKOUT=1 REPORT_ONLY=0 CHECK=0 DRIFT_ONLY=0 BANNER_SHOWN=0
 PRO_TOKEN_FILE=""
 TAILSCALE="" ALLOW_FROM="" ALLOW_FROM_SET=0 IPV6="" SSH_ALLOW="" RDP_ALLOW="" # empty means: ask
+FORWARD="" LOCK_AUDIT="" # empty means: ask on a terminal, otherwise keep the current setting
 ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -295,6 +304,13 @@ while [ $# -gt 0 ]; do
     --no-ssh) SSH_ALLOW=0 ;;
     --ipv6) IPV6=1 ;;
     --report-only) REPORT_ONLY=1 ;;
+    --forward-logs)
+      [ $# -ge 2 ] || { echo "--forward-logs needs a log server, e.g. syslog+tls://logs.example.com:6514" >&2; exit 2; }
+      FORWARD="$2"
+      ARGS+=("$1" "$2"); shift 2; continue ;;
+    --no-forward-logs) FORWARD=none ;;
+    --lock-audit) LOCK_AUDIT=1 ;;
+    --no-lock-audit) LOCK_AUDIT=0 ;;
     --banner-shown) BANNER_SHOWN=1; shift; continue ;; # internal: set when re-run through sudo
     -h | --help) usage; exit 0 ;;
     *) echo "unknown option: $1 (see --help)" >&2; exit 2 ;;
@@ -538,6 +554,50 @@ if [ "$READONLY" = 0 ]; then
     if [ "$INTERACTIVE" = 1 ]; then ask_yn "Does this device need IPv6? (if unsure, answer yes)" y || IPV6=0; fi
   fi
   if [ "$IPV6" = 1 ]; then ok "IPv6: kept"; else warn "IPv6: will be turned off"; fi
+
+  # Off-device log copies: the only tamper evidence that survives someone
+  # with administrator rights on this device. Unanswered, the current
+  # setting stays.
+  FWD_CONF=/etc/rsyslog.d/60-legion-forward.conf
+  current_forward="$(sed -n 's/^# Legion destination: //p' "$FWD_CONF" 2>/dev/null || true)"
+  if [ -z "$FORWARD" ] && [ "$INTERACTIVE" = 1 ]; then
+    info "a log server (SIEM) keeps a copy of the logs that nobody on this device can change"
+    if ask_yn "Send a copy of system and audit logs to a log server?" "$([ -n "$current_forward" ] && echo y || echo n)"; then
+      printf '  %s?%s log server, e.g. syslog+tls://logs.example.com:6514 %s: ' "$C_WARN" "$C_RST" "${current_forward:+[$current_forward]}" >&3
+      read -r FORWARD || FORWARD=""
+      FORWARD="${FORWARD:-$current_forward}"
+    else
+      FORWARD=none
+    fi
+  fi
+  [ -n "$FORWARD" ] || FORWARD="${current_forward:-none}"
+  if [ "$FORWARD" != none ]; then
+    if [[ "$FORWARD" =~ ^syslog(\+tls)?://([A-Za-z0-9.-]+|\[[0-9A-Fa-f:]+\]):([0-9]{1,5})$ ]] && [ "${BASH_REMATCH[3]}" -le 65535 ]; then
+      FWD_TLS=0 FWD_HOST="${BASH_REMATCH[2]}" FWD_PORT="${BASH_REMATCH[3]}"
+      [ -z "${BASH_REMATCH[1]}" ] || FWD_TLS=1
+      FWD_HOST="${FWD_HOST#[}" FWD_HOST="${FWD_HOST%]}"
+      if [ "$FWD_TLS" = 1 ]; then ok "log forwarding: $FORWARD (encrypted)"; else warn "log forwarding: $FORWARD (not encrypted; use syslog+tls:// if the server supports it)"; fi
+    else
+      fail "log server '$FORWARD' not understood: use syslog+tls://HOST:PORT or syslog://HOST:PORT"
+      exit 2
+    fi
+  else
+    info "log forwarding: off (logs stay on this device)"
+  fi
+
+  # Locked audit rules (auditd immutable mode): nobody, including root, can
+  # change or turn off auditing until the next restart. Opt-in, because Legion
+  # (and anyone) then needs a restart to change audit rules.
+  current_lock=0
+  [ ! -f /etc/audit/rules.d/99-legion-lock.rules ] || current_lock=1
+  if [ -z "$LOCK_AUDIT" ] && [ "$INTERACTIVE" = 1 ]; then
+    info "locked audit rules stop anyone, even an administrator, from turning auditing off without a restart"
+    info "changing audit rules then needs a restart, including Legion's own updates"
+    LOCK_AUDIT=0
+    ask_yn "Lock the audit rules until each restart?" "$([ "$current_lock" = 1 ] && echo y || echo n)" && LOCK_AUDIT=1
+  fi
+  [ -n "$LOCK_AUDIT" ] || LOCK_AUDIT="$current_lock"
+  if [ "$LOCK_AUDIT" = 1 ]; then ok "audit rules: will be locked; changing them needs a restart"; else info "audit rules: not locked"; fi
 fi
 
 # Ubuntu Pro: security updates for every package (ESM) and Livepatch. The
@@ -665,7 +725,7 @@ add_signed_repo() {
 }
 
 STEP=0
-TOTAL=$((12 + WITH_PRO + YARA + AIDE + LOCKOUT + TOOLS))
+TOTAL=$((13 + WITH_PRO + YARA + AIDE + LOCKOUT + TOOLS))
 RESULTS=()
 FAILED=0
 
@@ -919,9 +979,31 @@ step_audit() {
     echo "## Firewall and audit settings"
     audit_watch firewall /etc/ufw
     audit_watch audit-config /etc/audit /etc/libaudit.conf
+    echo "## Legion itself: its programs, settings, schedules and baselines"
+    audit_watch legion-tamper /usr/local/sbin /etc/legion /var/lib/legion/aide /etc/systemd/system \
+      /etc/apt/apt.conf.d/99legion-aide /etc/sudoers.d/legion /usr/share/pam-configs /etc/rsyslog.d \
+      /etc/dconf/db/local.d /etc/gdm3/greeter.dconf-defaults /etc/sysctl.d /etc/modprobe.d
+    echo "## AI coding agent settings (hooks, MCP servers, permissions)"
+    audit_watch ai-agent-config /etc/claude-code
+    local home
+    while IFS=: read -r _ _ real _ _ home _; do
+      if [ "$real" -ge 1000 ] 2>/dev/null && [ "$real" -lt 60000 ] && [ -d "$home" ]; then
+        audit_watch ai-agent-config "$home/.claude/settings.json" "$home/.claude/settings.local.json" \
+          "$home/.mcp.json" "$home/.cursor/mcp.json" "$home/.codex/config.toml" "$home/.gemini/settings.json"
+      fi
+    done </etc/passwd
   } >/etc/audit/rules.d/legion.rules.new
   chmod 640 /etc/audit/rules.d/legion.rules.new
   mv -f /etc/audit/rules.d/legion.rules.new /etc/audit/rules.d/legion.rules
+  # Locked rules (opt-in): "-e 2" must be the very last rule loaded.
+  if [ "$LOCK_AUDIT" = 1 ]; then
+    printf '# Legion Profile: lock the audit rules until the next restart.\n-e 2\n' >/etc/audit/rules.d/99-legion-lock.rules
+    chmod 640 /etc/audit/rules.d/99-legion-lock.rules
+  else
+    rm -f /etc/audit/rules.d/99-legion-lock.rules
+  fi
+  local locked=0
+  [ "$IN_CONTAINER" = 1 ] || ! auditctl -s 2>/dev/null | grep -qx 'enabled 2' || locked=1
   # Logs rotate and never fill the disk: 20 files of 32 MB. When the disk
   # runs low anyway, an alert goes to the system log and to logged-in users
   # (800-171 3.3.4) and auditd keeps recording.
@@ -951,6 +1033,13 @@ EOF
     return 0
   fi
   systemctl enable auditd
+  if [ "$locked" = 1 ]; then
+    # The kernel refuses rule changes until a restart; that is the point.
+    rm -f "$conf.legion-prev"
+    : >"$FLAGS/restart-audit"
+    info "audit rules are locked: the new rules and settings apply after a restart"
+    return 0
+  fi
   systemctl restart auditd 2>/dev/null || systemctl reload auditd 2>/dev/null || true
   sleep 1
   if ! systemctl is-active -q auditd; then
@@ -964,6 +1053,55 @@ EOF
     return 1
   fi
   info "$(auditctl -l | grep -c .) audit rules loaded"
+  [ "$LOCK_AUDIT" = 0 ] || info "audit rules are locked until the next restart"
+}
+
+step_forward() {
+  # A copy of system and audit logs goes to a log server (800-53 AU-4(1),
+  # AU-9(2)). rsyslog keeps a queue on disk (up to 1 GB), so nothing is lost
+  # while the device is offline. The audit log is sent from its file, so it
+  # does not also fill the system journal.
+  local f="$FWD_CONF"
+  if [ "$FORWARD" = none ]; then
+    if [ -f "$f" ]; then
+      rm -f "$f"
+      systemctl try-restart rsyslog 2>/dev/null || true
+      info "log forwarding turned off"
+    fi
+    return 0
+  fi
+  local pkgs=(rsyslog)
+  [ "$FWD_TLS" = 0 ] || pkgs+=(rsyslog-gnutls)
+  apt-get "${APT[@]}" install "${pkgs[@]}"
+  local tls=""
+  if [ "$FWD_TLS" = 1 ]; then
+    tls="StreamDriver=\"gtls\" StreamDriverMode=\"1\" StreamDriverAuthMode=\"x509/name\"
+    StreamDriverPermittedPeers=\"$FWD_HOST\" StreamDriver.CAFile=\"/etc/ssl/certs/ca-certificates.crt\""
+  fi
+  cat >"$f.new" <<EOF
+# Legion Profile: copies of system and audit logs go to a log server.
+# Legion destination: $FORWARD
+# Turn off with: sudo legion --no-forward-logs (or legion-remove.sh)
+module(load="imfile")
+ruleset(name="legion-forward") {
+  action(type="omfwd" Target="$FWD_HOST" Port="$FWD_PORT" Protocol="tcp"
+    $tls
+    Template="RSYSLOG_SyslogProtocol23Format"
+    queue.type="LinkedList" queue.filename="legion-forward" queue.maxDiskSpace="1g"
+    queue.saveOnShutdown="on" action.resumeRetryCount="-1" action.resumeInterval="30")
+}
+input(type="imfile" File="/var/log/audit/audit.log" Tag="audit:" Facility="local6" Ruleset="legion-forward")
+call legion-forward
+EOF
+  mv -f "$f.new" "$f"
+  if ! rsyslogd -N1 >/dev/null 2>&1; then
+    rm -f "$f"
+    warn "log forwarding not set up: rsyslog did not accept the settings"
+    return 1
+  fi
+  systemctl enable rsyslog
+  systemctl restart rsyslog
+  info "system and audit logs now also go to $FORWARD"
 }
 
 step_logs() {
@@ -986,6 +1124,15 @@ step_clamav() {
 [Unit]
 Description=Weekly ClamAV scan of /home
 [Service]
+# Sandboxed (Legion tamper protection): system and home folders read-only,
+# no privilege gain, private /tmp, kernel settings read-only.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
 Type=oneshot
 Nice=19
 IOSchedulingClass=idle
@@ -1370,6 +1517,15 @@ Description=Weekly YARA scan of user-writable folders
 Wants=network-online.target
 After=network-online.target
 [Service]
+# Sandboxed (Legion tamper protection): system and home folders read-only,
+# no privilege gain, private /tmp, kernel settings read-only.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
 Type=oneshot
 Nice=19
 IOSchedulingClass=idle
@@ -1546,6 +1702,15 @@ EOF
 [Unit]
 Description=Daily integrity check (package checksums and AIDE)
 [Service]
+# Sandboxed (Legion tamper protection): system and home folders read-only,
+# no privilege gain, private /tmp, kernel settings read-only.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
 Type=oneshot
 Nice=19
 IOSchedulingClass=idle
@@ -1754,6 +1919,15 @@ step_compliance() {
 [Unit]
 Description=Daily Legion Profile compliance check
 [Service]
+# Sandboxed (Legion tamper protection): system and home folders read-only,
+# no privilege gain, private /tmp, kernel settings read-only.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
 Type=oneshot
 Nice=19
 IOSchedulingClass=idle
@@ -1825,6 +1999,15 @@ Description=Weekly Legion Profile vulnerability scan (Ubuntu OVAL)
 Wants=network-online.target
 After=network-online.target
 [Service]
+# Sandboxed (Legion tamper protection): system and home folders read-only,
+# no privilege gain, private /tmp, kernel settings read-only.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
 Type=oneshot
 Nice=19
 IOSchedulingClass=idle
@@ -1869,6 +2052,7 @@ if [ "$READONLY" = 0 ]; then
   [ "$LOCKOUT" = 0 ] || run_step "Account lockout: 5 failed logins, 30 minutes" step_lockout
   [ "$TOOLS" = 0 ] || run_step "Tools: audit, secrets, backups, Terraform, Trivy" step_tools
   run_step "Audit logging (auditd)" step_audit
+  run_step "Log forwarding to a log server" step_forward
   run_step "Compliance: daily check, weekly vulnerability scan" step_compliance
   # Legion's own later steps change files AIDE watches; accept them (logged in
   # integrity.log) so the next daily check does not report them.
@@ -1943,7 +2127,7 @@ c_audit_rules() {
   in_container && return 2
   local r k
   r="$(auditctl -l 2>/dev/null)"
-  for k in identity privilege user_emulation session logins system-locale time modules perm_mod access mounts delete MAC-policy privileged; do
+  for k in identity privilege user_emulation session logins system-locale time modules perm_mod access mounts delete MAC-policy privileged legion-tamper; do
     # auditctl -l shows file watches as "-k NAME" and syscall rules as "key=NAME".
     grep -qE -- "(-k |key=)$k( |$)" <<<"$r" || { NOTE="audit rules for '$k' not loaded"; return 1; }
   done
@@ -2195,6 +2379,22 @@ c_audit_alert() {
     NOTE="audit log disk ran low on $(cat /var/lib/legion/audit-space-low); free up space"; return 1
   fi
 }
+c_forwarding() {
+  local f=/etc/rsyslog.d/60-legion-forward.conf dest kb
+  [ -f "$f" ] || { NOTE="optional: logs stay on this device (set a log server with --forward-logs)"; return 2; }
+  dest="$(sed -n 's/^# Legion destination: //p' "$f")"
+  systemctl is-active -q rsyslog || { NOTE="rsyslog is not running, so nothing reaches $dest"; return 1; }
+  # Logs waiting in the disk queue: some is normal while offline.
+  kb="$(du -sk /var/spool/rsyslog/legion-forward* 2>/dev/null | awk '{ s += $1 } END { print s + 0 }')"
+  [ "$kb" -lt 102400 ] || { NOTE="$((kb / 1024)) MB of logs waiting to reach $dest"; return 1; }
+  NOTE="to $dest"
+}
+c_audit_lock() {
+  [ -f /etc/audit/rules.d/99-legion-lock.rules ] || { NOTE="optional: audit rules can be changed by an administrator (lock with --lock-audit)"; return 2; }
+  in_container && return 2
+  auditctl -s 2>/dev/null | grep -qx 'enabled 2' && { NOTE="locked until the next restart"; return 0; }
+  NOTE="set to lock, but not locked yet: restart the device"; return 1
+}
 c_vulns() {
   local f=/var/lib/legion/oval/last when n age
   systemctl is-enabled -q legion-vuln-scan.timer 2>/dev/null || { NOTE="vulnerability scan not set up"; return 1; }
@@ -2297,6 +2497,8 @@ CHECKS=(
   "auditd|Audit logging running|c_auditd|CC7.2|164.312(b)|AU-12|3.3.1"
   "audit-rules|Audit rules (CIS set: accounts, sudo, logins, access, changes)|c_audit_rules|CC7.2|164.312(b)|AU-2|3.3.1"
   "audit-alert|Alert when the audit log disk runs low|c_audit_alert|CC7.2|164.312(b)|AU-5|3.3.4"
+  "audit-lock|Audit rules locked until restart|c_audit_lock|CC7.2|164.312(b)|AU-9|3.3.8"
+  "log-forwarding|Logs copied to a log server|c_forwarding|CC7.2|164.312(b)|AU-9(2)|3.3.8"
   "log-retention|System logs kept for 1 year|c_log_retention|CC7.2|164.312(b)|AU-11|3.3.1"
   "log-protection|Audit logs readable only by admins|c_log_protect|CC7.2|164.312(b)|AU-9|3.3.8"
   "time-sync|Clock synchronized|c_time|CC7.2|164.312(b)|AU-8|3.3.7"
@@ -2443,7 +2645,7 @@ make_bundle() {
     /etc/login.defs /etc/default/useradd /etc/profile.d/legion-session.sh /etc/sudoers.d/legion \
     /etc/security/limits.d/legion.conf /etc/systemd/coredump.conf.d/legion.conf /etc/modprobe.d/legion-filesystems.conf \
     /etc/ssh/sshd_config.d/00-legion.conf /etc/audit/auditd.conf /etc/gdm3/greeter.dconf-defaults \
-    /etc/dconf/db/local.d/00-legion-media; do
+    /etc/dconf/db/local.d/00-legion-media /etc/audit/rules.d/99-legion-lock.rules /etc/rsyslog.d/60-legion-forward.conf; do
     [ ! -f "$f" ] || cp "$f" "$b/settings/$(echo "${f#/}" | tr / _)"
   done
   {
@@ -2452,6 +2654,11 @@ make_bundle() {
     echo; echo "== audit rules"; auditctl -l 2>&1
     echo; echo "== legion timers"; systemctl list-timers --all --no-pager 'legion*' 'clamscan*' 2>&1
     echo; echo "== failed units"; systemctl --failed --no-pager 2>&1
+    echo; echo "== audit status (enabled 2 = locked)"; auditctl -s 2>&1
+    # A swapped-in integrity baseline would show as a changed checksum
+    # between bundles.
+    echo; echo "== integrity baseline checksums"
+    sha256sum "$STATE"/aide/aide.db* /usr/local/sbin/legion* 2>&1
   } >"$b/status/status.txt"
   (cd "$b" && find . -type f -print0 | sort -z | xargs -0 sha256sum >"$tmp/SHA256SUMS") && mv "$tmp/SHA256SUMS" "$b/SHA256SUMS"
   tar -C "$tmp" -czf "$dir/$name.tar.gz" "$name"
@@ -2538,5 +2745,6 @@ if [ "${PATCH_FAILED:-0}" = 1 ]; then
   fail "installing updates did not finish. Check the run log and fix it before you reboot"
 else
   info "reboot now to finish the kernel and library updates"
+  [ ! -f "$FLAGS/restart-audit" ] || warn "the audit rules were locked, so the new ones apply only after this reboot"
 fi
 [ "$FAILED" = 0 ] || exit 1

@@ -19,6 +19,9 @@ CIS and DISA STIG have not published benchmarks for Ubuntu 26.04 yet. Until they
 - Sessions: idle console and SSH sessions end after 15 minutes, new files are private to their owner (umask 027), sudo asks for the password again after 15 minutes, and only root can use su
 - Audit logging: the CIS set of audit rules. Changes to accounts, sudo and settings, logins, refused file access, permission changes, deletions, mounts, kernel modules and every use of a privileged program. You get an alert when the audit log disk runs low
 - Log retention: keeps system logs for 1 year
+- Log forwarding (optional): sends a copy of system and audit logs to your log server over syslog, with TLS if you want it. Logs wait on disk while the server is unreachable
+- Audit lock (optional): the audit rules cannot be changed or turned off, even by root, until the next restart
+- Tamper alerts: changes to Legion's own scripts, settings and baseline, and to AI coding agent settings, are recorded in the audit log. Legion's scan services run in a sandbox
 - Malware scanning: ClamAV weekly, plus YARA weekly with the YARA Forge core rules
 - Vulnerability scanning: weekly, with Ubuntu's own security notices (OVAL) and OpenSCAP
 - File integrity: daily check of installed package files and of /etc, /boot, /usr/local and /root
@@ -38,7 +41,15 @@ cd legion-profile
 bash legion.sh
 ```
 
-It asks for your sudo password, then a few questions so the firewall does not cut you off: whether to keep SSH or Remote Desktop reachable (if they are running), whether you use Tailscale, which private networks need to reach this device, and whether you need IPv6. It also asks for your Ubuntu Pro token (press Enter to skip). Then it runs each step and shows the result. Reboot when it finishes.
+It asks for your sudo password, then a few questions so the firewall does not cut you off: whether to keep SSH or Remote Desktop reachable (if they are running), whether you use Tailscale, which private networks need to reach this device, and whether you need IPv6. It also asks for your Ubuntu Pro token (press Enter to skip), whether to send logs to a log server, and whether to lock the audit rules. Then it runs each step and shows the result. Reboot when it finishes.
+
+The log server address looks like `syslog://logs.example.com:514`, or `syslog+tls://logs.example.com:6514` for TLS (checked against the system's trusted certificates). The same answers can be given as options, so the questions are skipped:
+
+```bash
+bash legion.sh --forward-logs syslog+tls://logs.example.com:6514 --lock-audit
+```
+
+`--no-forward-logs` and `--no-lock-audit` turn them off again. When the audit rules are locked, changes to them take effect after the next restart.
 
 To skip the token question:
 
@@ -78,13 +89,13 @@ bash tests/run.sh
 
 It installs Legion, checks the firewall, lockout, passwords, sessions, integrity and scan results, runs Legion again, removes it and confirms the system is back to how it was.
 
-Containers cannot load audit rules or kernel settings, so a second test runs Legion in a real Ubuntu 26.04 virtual machine (QEMU, inside Docker), reboots it, checks again and removes Legion:
+Containers cannot load audit rules or kernel settings, so a second test runs Legion in a real Ubuntu 26.04 virtual machine (QEMU, inside Docker) with the GNOME desktop. It installs Legion with the audit lock and log forwarding, restarts several times, and after each restart logs in at the login screen (typed like a person would), on the text console and with sudo. Then it runs Legion again, removes it, restarts and checks that logins still work. Screenshots of the login screen and the desktop are saved:
 
 ```bash
 bash tests/vm/run.sh
 ```
 
-It needs Docker and hardware virtualization (/dev/kvm), and downloads the Ubuntu cloud image once.
+It needs Docker and hardware virtualization (/dev/kvm), and downloads the Ubuntu cloud image once. It takes about 30 minutes.
 
 ## How to remove it
 
@@ -104,5 +115,7 @@ It keeps installed updates, Ubuntu Pro and your logs. Add `--remove-packages`, `
 - Passwords expire every 90 days. On the first run, a password that is already older than 76 days gets 14 more days, so nobody is forced to change it in the middle of a session.
 - Files you create are no longer readable by other users. Commands run with sudo keep Ubuntu's usual permissions, so software installed with sudo still works for everyone.
 - Some filesystems are blocked: hfs and hfsplus (Mac drives), udf (DVDs and some USB drives), cramfs, freevxfs and jffs2. USB drives formatted as FAT, exFAT or NTFS work as usual.
+- Log forwarding sends standard syslog over TCP or TLS, which most log servers and SIEMs accept. Services that only take HTTP uploads or a cloud resource ID need their vendor's own agent.
+- If the audit rules are locked, removing Legion leaves them active until the next restart.
 - sudo-rs, Ubuntu 26.04's sudo, has no separate log file. sudo use is recorded in the system journal and by the audit rules.
 - Earlier versions of Legion installed the Postfix mail server as a side effect of installing AIDE. Legion now sets Postfix to accept connections from this device only. If nothing on your machine sends mail, you can remove it: `sudo apt purge postfix bsd-mailx`.

@@ -229,13 +229,20 @@ if [ -e "$B/20auto-upgrades" ]; then
 elif [ -e "$B/20auto-upgrades.absent" ]; then
   undo "automatic update settings restored" rm -f /etc/apt/apt.conf.d/20auto-upgrades
 fi
-undo "audit rules removed" rm -f /etc/audit/rules.d/legion.rules /etc/audit/rules.d/soc2.rules /usr/local/sbin/legion-audit-alert
+AUDIT_LOCKED=0
+! in_container && auditctl -s 2>/dev/null | grep -qx 'enabled 2' && AUDIT_LOCKED=1
+undo "audit rules removed" rm -f /etc/audit/rules.d/legion.rules /etc/audit/rules.d/soc2.rules /etc/audit/rules.d/99-legion-lock.rules /usr/local/sbin/legion-audit-alert
+if [ -f /etc/rsyslog.d/60-legion-forward.conf ]; then
+  undo "log forwarding to the log server stopped" bash -c 'rm -f /etc/rsyslog.d/60-legion-forward.conf && systemctl try-restart rsyslog'
+fi
 if [ -f "$B/auditd.conf" ]; then
   undo "audit settings restored" cp -p "$B/auditd.conf" /etc/audit/auditd.conf
 elif [ -f /etc/audit/auditd.conf ]; then
   undo "audit log rotation back to Ubuntu default (5 files)" sed -i -E 's/^num_logs\s*=.*/num_logs = 5/' /etc/audit/auditd.conf
 fi
-if command -v augenrules >/dev/null && ! in_container; then
+if [ "$AUDIT_LOCKED" = 1 ]; then
+  warn "the audit rules are locked until a restart; Legion's rules stop after you reboot"
+elif command -v augenrules >/dev/null && ! in_container; then
   undo "audit rules reloaded" augenrules --load
 fi
 undo "log retention back to Ubuntu default" bash -c 'rm -f /etc/systemd/journald.conf.d/legion.conf /etc/systemd/journald.conf.d/soc2.conf; systemctl restart systemd-journald'
@@ -322,6 +329,7 @@ section "Result"
 if [ "$FAILED" = 0 ]; then
   ok "Legion Profile removed"
   info "reboot to make sure every kernel setting is back to normal"
+  [ "$AUDIT_LOCKED" = 0 ] || warn "reboot needed: the locked audit rules stay active until then"
 else
   fail "$FAILED step(s) could not be undone; see the lines marked above"
   exit 1
