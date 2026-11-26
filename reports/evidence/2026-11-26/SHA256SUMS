@@ -1,0 +1,13 @@
+a1b315a74421f3a8df679f5955c29a146412db765729f37da447fbbe02e7348f  ./attack.log
+7511c1ace39dcbd96a24c02073b14a8ea6f92de01f532d3f5045da6a9eccc08c  ./attack-report.md
+604e050c9618a81f929e36d9ecaa37162df34fd8a35d71ab229ddcb43f3399d4  ./container.log
+58508034647c852e61475ad1fa7b58d8abf145e816ab2c1415c3a26f45456759  ./screenshots/after-removal-after-login.png
+7e72fd90fcb8205fe6301af0d9fe6cc2bc01e7c282379563556f8a9286c59188  ./screenshots/after-removal-login-screen.png
+946467b91efbfdcc60930e7d311f16b2bac0ac765d9474c41ab5ffbcfd166374  ./screenshots/after-restart-1-after-login.png
+10a329f3c2a461bdf56ed98bf546fd735b7c6437019deed8069ee6f3f700d573  ./screenshots/after-restart-1-login-screen.png
+101c187475a8516259f4b2e9ccc230464110c2492ee55dc5f95d3e02ed260dbb  ./screenshots/after-restart-2-after-login.png
+196c99e966b2e2ccd8fb973f235063c423ef3545959c64a8b3c64d557dc4f628  ./screenshots/after-restart-2-login-screen.png
+126c988333c6276392ba7529e788f27d6d550e9ea9212596175530a10c7ba148  ./screenshots/before-legion-after-login.png
+e8ab9234780b4ea3d46fc3860cc43a6a1d3985d361a01973e907080b9c50045e  ./screenshots/before-legion-login-screen.png
+67da83e548c83bf86ba38b87c8826191ee2702ddbd341aa517b07be9103b1cf3  ./tested-commit.txt
+cdbfb27b36203a7e8d4ee88282873f0264df72612228a5b813937692883e7488  ./vm-console.log.gz

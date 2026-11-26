@@ -26,6 +26,7 @@ for l in sys.stdin:
     a = json.loads(l)
     print("        " + a["level"] + ": " + a["rule"] + " | " + a["user"] + " | " + (a["command"] or a["file"] or a["program"])[:80] + " | " + a["yara"])'
   tail -n +"$((before + 1))" "$ALERTS" >"$D/alerts.new"
+  [ ! -s /var/lib/legion/sigma/unmatched.log ] || sed 's/^/        unmatched: /' /var/lib/legion/sigma/unmatched.log | cut -c1-400
 }
 rules_loaded() { auditctl -l 2>/dev/null | grep -vc '^No rules'; }
 apt_get() { DEBIAN_FRONTEND=noninteractive apt-get -y -q -o DPkg::Lock::Timeout=900 "$@"; }

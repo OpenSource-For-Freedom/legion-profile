@@ -5,7 +5,7 @@ workload through three event sources on one VM and runs all 217 Linux Sigma
 rules (every level) against each, with Zircolite 4.7.1.
 
 - **Test:** `bash tests/vm/run.sh --sensors` (script: `tests/vm/sensors.sh`)
-- **Raw output:** `evidence/<date>/sensors.log`
+- **Run:** 2026-11-26, 8 checks passed, 0 failed. Its raw log was overwritten when a later rerun was stopped to free memory on the test machine; the figures below were recorded from that run's output. Rerun the test to reproduce them.
 - **System:** Ubuntu 26.04.1, kernel 7.0.0-43, auditd 4.1.2 with Legion's rules (not locked), Laurel 0.7.3 (Ubuntu package), Sysmon for Linux 1.5.3 (Microsoft's package repository for Ubuntu 26.04)
 
 ## Workload

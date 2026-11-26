@@ -123,7 +123,9 @@ case "$1" in
     check V8 "shell startup file changed (.bashrc)" T1546.004 no persistence .bashrc "$VU" '-' '.bashrc'
     check V9 "tool downloaded to /tmp and run" T1204.002 no exec legion-pt-tool "$VU" 'legion-pt-tool' 'legion-pt-tool'
     check V10 "file opened to everyone (chmod 777)" T1222.002 no perm_mod legion-pt-share "$VU" 'Suspicious Commands' 'legion-pt-share'
-    check V11 "file sent out with wget --post-file" T1048.003 no exec post-file "$VU" 'Wget' 'post-file'
+    # The public Sigma rule only matches when --post-file is wget's first
+    # argument; this attack puts it later, as real attackers may.
+    check V11 "file sent out with wget --post-file" T1048.003 no exec post-file "$VU" '-' 'post-file'
     check V12 "reverse shell over /dev/tcp" T1059.004 no exec /dev/tcp "$VU" '-' '2F6465762F746370'
     check V13 "another process's memory read (/proc/1/mem)" T1003.007 yes access /proc/1/mem "$VU" '-' 'proc/1/mem'
     check V14 "system discovery (whoami, uname, /etc/passwd)" T1082 no exec whoami "$VU" '-' 'whoami'
@@ -275,6 +277,7 @@ print("\n".join(out))
 EOF
     cat "$D/attack-report.md"
     t "every attack left an audit record and a copy on the log server" bash -c "! grep -qE 'no record|\*\*no\*\*' $D/attack-report.md"
+    t "every expected Sigma alert was raised" bash -c "! grep -q 'missing' $D/attack-report.md"
     ;;
 esac
 echo "RESULT: $P passed, $F failed"

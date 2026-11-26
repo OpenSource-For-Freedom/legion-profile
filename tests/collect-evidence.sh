@@ -24,9 +24,12 @@ for f in container vm attack sensors; do
   [ ! -s ".testlogs/$f.log" ] || clean <".testlogs/$f.log" >"$dest/$f.log"
 done
 [ ! -s "$cache/out-attack/attack-report.md" ] || cp "$cache/out-attack/attack-report.md" "$dest/"
-cp "$cache"/out-full/*.png "$dest/screenshots/" 2>/dev/null || true
-# The VM's serial console: logins and the banner as a person sees them.
-[ ! -s "$cache/out-full/console.log" ] || clean <"$cache/out-full/console.log" | gzip -9 >"$dest/vm-console.log.gz"
+# Screenshots and the serial console (logins and the banner as a person sees
+# them) from the latest desktop run; older runners wrote them to out/.
+full="$cache/out-full"
+ls "$full"/*.png >/dev/null 2>&1 || full="$cache/out"
+cp "$full"/*.png "$dest/screenshots/" 2>/dev/null || true
+[ ! -s "$full/console.log" ] || clean <"$full/console.log" | gzip -9 >"$dest/vm-console.log.gz"
 git rev-parse HEAD >"$dest/tested-commit.txt" 2>/dev/null || true
 git status --short >>"$dest/tested-commit.txt" 2>/dev/null || true
 sums="$(cd "$dest" && find . -type f -print0 | sort -z | xargs -0 sha256sum)"

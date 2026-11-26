@@ -1763,6 +1763,16 @@ def locate(m):
         # A field Zircolite reformatted: take the closest record of that second.
         if sec == epoch and score > best_score and score >= 0.7 * len(want):
             best, best_score = (epoch, serial), score
+    if best[1] is None:
+        # Record why, to tune the matching: the fields that differed from the
+        # closest record of the same type.
+        near = max(records.get(m.get("type", ""), [({}, 0, 0)]), key=lambda r: sum(r[0].get(k) == v for k, v in want.items()))[0]
+        diff = {k: [v, near.get(k)] for k, v in want.items() if near.get(k) != v}
+        try:
+            with open("/var/lib/legion/sigma/unmatched.log", "a") as f:
+                f.write(json.dumps({"type": m.get("type"), "timestamp": m.get("timestamp"), "differs": diff}) + "\n")
+        except OSError:
+            pass
     return best
 
 ignore = set()
@@ -1807,10 +1817,17 @@ for d in json.load(open(found_file)):
         if (title, serial) in seen:
             continue
         seen.add((title, serial))
-        call = calls.get(serial, {})
+        # Without the full event, a SYSCALL match still carries its own user,
+        # program and process.
+        call = calls.get(serial) or (m if m.get("type") == "SYSCALL" else {})
         exe = call.get("exe", m.get("exe", ""))
         if exe in PACKAGE_TOOLS:
             continue
+        # One program run can match a rule on many system calls: one alert.
+        run = (title, exe, call.get("pid", ""))
+        if exe and call.get("pid") and run in seen:
+            continue
+        seen.add(run)
         target = m.get("name") if m.get("type") == "PATH" else exe
         if target and not target.startswith("/") and call.get("cwd"):
             target = os.path.join(call["cwd"], target)

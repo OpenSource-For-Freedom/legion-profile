@@ -1,0 +1,250 @@
+DEPRECATED: The legacy builder is deprecated and will be removed in a future release.
+            Install the buildx component to build images with BuildKit:
+            https://docs.docker.com/go/buildx/
+
+screenshots and console log: <vm-cache>/out-attack
+VM up: Ubuntu 26.04.1 LTS
+7.0.0-43-generic
+=== prepare: a web service on port 8080, a log server, a second user
+Created symlink '/etc/systemd/system/multi-user.target.wants/test-log-server.service' → '/etc/systemd/system/test-log-server.service'.
+Created symlink '/etc/systemd/system/multi-user.target.wants/test-web.service' → '/etc/systemd/system/test-web.service'.
+PASS  web service listening on 8080
+RESULT: 1 passed, 0 failed
+PASS  before Legion: the web service is reachable from outside (the test can see it)
+PASS  before Legion: victim can log in over SSH with a password
+=== install Legion: audit rules locked, logs forwarded
+PASS  legion exits 0 (got 0)
+RESULT: 1 passed, 0 failed
+=== restart (Legion installed)
+      back after 16 s
+=== after restart: attacks start now
+PASS  audit rules locked
+      123 audit rules loaded
+RESULT: 1 passed, 0 failed
+=== attacks from outside: port 8080
+=== attacks by an ordinary user, over an SSH login
+=== attacks by an administrator (legion, through sudo)
+useradd warning: legion-pt-root's uid 0 outside of the UID_MIN 1000 and UID_MAX 60000 range.
+userdel: user legion-pt-root is currently used by process 1
+PASS  A1 audit record: Preload library planted (/etc/ld.so.preload)
+PASS  A2 audit record: Second root account created (UID 0)
+PASS  A3 audit record: Kernel module loaded with insmod
+PASS  A4 blocked: Mac filesystem module (hfsplus) cannot be loaded
+PASS  A4 audit record: Blocked filesystem module requested
+PASS  A5 audit record: Firewall turned off
+PASS  A5 firewall back on after the attack
+PASS  A6 audit record: sudo rule added for a backdoor account
+PASS  A7 audit record: Memory randomization (ASLR) turned off
+PASS  A8 audit record: System service created
+PASS  A9 audit record: PAM module configuration added
+PASS  A10 audit record: Logging configuration changed
+RESULT: 12 passed, 0 failed
+=== evidence for the attacks by an ordinary user (victim, over SSH)
+PASS  V1 audit record: Password hashes read (/etc/shadow)
+PASS  V2 audit record: sudo tried without permission
+PASS  V3 audit record: setuid copy of a shell made
+PASS  V4 audit record: cron job added
+PASS  V5 audit record: systemd user service added
+PASS  V6 audit record: desktop autostart entry added
+PASS  V7 audit record: SSH key planted (authorized_keys)
+PASS  V8 audit record: shell startup file changed (.bashrc)
+PASS  V9 audit record: tool downloaded to /tmp and run
+PASS  V10 audit record: file opened to everyone (chmod 777)
+PASS  V11 audit record: file sent out with wget --post-file
+PASS  V12 audit record: reverse shell over /dev/tcp
+PASS  V13 audit record: another process's memory read (/proc/1/mem)
+PASS  V14 audit record: system discovery (whoami, uname, /etc/passwd)
+PASS  V15 audit record: preload library planted without root
+PASS  V1 blocked: victim cannot read /etc/shadow
+PASS  V13 blocked: victim cannot read another process's memory
+RESULT: 17 passed, 0 failed
+=== Sigma check and YARA scan over everything so far
+Job for legion-sigma-scan.service failed because the control process exited with error code.
+See "systemctl status legion-sigma-scan.service" and "journalctl -xeu legion-sigma-scan.service" for details.
+      Sigma check result: exit-code, 65 alerts
+        high: Loading of Kernel Module via Insmod |  | /usr/bin/kmod | YARA: no match
+        high: Modification of ld.so.preload | legion | /etc/ld.so.preload | no file to scan
+        high: Modification of ld.so.preload | legion | /etc/ld.so.preload | no file to scan
+        high: Disable System Firewall |  | /usr/lib/systemd/systemd | YARA: no match
+        high: Logging Configuration Changes on Linux Host | legion | /etc/rsyslog.conf | YARA: no match
+        high: ASLR Disabled Via Sysctl or Direct Syscall - Linux | legion | sysctl -w kernel.randomize_va_space=0 | YARA: no match
+        medium: Suspicious Commands Linux | victim | cp /bin/sh /home/victim/legion-pt-suid | YARA: no match
+        medium: Suspicious Commands Linux | victim | chmod u+s /home/victim/legion-pt-suid | YARA: no match
+        medium: Suspicious Commands Linux | victim | chmod 777 /home/victim/legion-pt-share | YARA: no match
+        medium: Systemd Service Creation | victim | /home/victim/.config/systemd/user/legion-pt.service | YARA: no match
+        medium: Systemd Service Creation | legion | /etc/systemd/system/legion-pt.service | no file to scan
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Creation Of An User Account |  | /usr/sbin/useradd | YARA: no match
+        medium: Program Executions in Suspicious Folders |  | /tmp/legion-pt-tool | YARA match: SIGNATURE_BASE_APT_MAL_Sandworm_Exaramel_Configuration_Key
+        medium: Unix Shell Configuration Modification | victim | /home/victim/.bashrc | YARA: no match
+PASS  the /tmp tool was found by YARA when Sigma flagged it
+Job for legion-yara-scan.service failed because the control process exited with error code.
+See "systemctl status legion-yara-scan.service" and "journalctl -xeu legion-yara-scan.service" for details.
+      weekly YARA scan, run now: exit-code in 6 s
+PASS  weekly YARA scan finds the dropped tool
+RESULT: 2 passed, 0 failed
+=== attacks on the audit trail itself (as administrator)
+PASS  T1 locked: audit rules cannot be deleted
+PASS  T2 locked: auditing cannot be turned off
+PASS  T3 auditd refuses to be stopped
+PASS  T4 auditd killed with SIGKILL comes back by itself
+PASS  T4 rules still loaded and locked after the kill
+PASS  T1 audit record: audit rules deletion tried
+PASS  T4 audit record: auditd killed
+PASS  T5 audit record: Legion's detection program changed
+PASS  T6 the wipe of the audit log is itself recorded
+PASS  T6 Sigma check copes with the wiped log
+RESULT: 10 passed, 0 failed
+=== stability: is SSH still responsive during an audit flood?
+PASS  S0 new SSH logins still work during an audit flood
+=== stability: audit flood and command storm
+      50000 refused file opens in 1.8s, 5000 commands in 3.6s; audit events lost: 0; backlog: 7
+PASS  S1 no audit events lost under a 50000-event flood
+PASS  S2 auditd still running after the flood
+      Sigma check over the flood: 28.3s, peak memory 729 MB, success
+PASS  S3 Sigma check finishes the flood in under 5 minutes
+PASS  S4 the flood reached the log server too
+      flood records on the log server: 47001
+PASS  S5 auditd security update installs cleanly (exit 0)
+PASS  S5 auditd running and rules still locked after the update
+RESULT: 6 passed, 0 failed
+=== attacks from outside: password guessing and root login over SSH
+      waiting for the firewall's 30-second SSH rate limit to pass
+=== evidence for the attacks from outside (from the runner, over the network)
+PASS  E1 blocked: web service on 8080 not reachable from outside
+PASS  E1 firewall logged the blocked connection
+PASS  E2 blocked: SSH password guessing locks the account
+PASS  E2 SSH connections rate-limited by the firewall
+PASS  E2 each failed password is in the audit log
+PASS  E3 blocked: root cannot log in over SSH
+RESULT: 6 passed, 0 failed
+=== restart (after the attacks)
+      back after 16 s
+PASS  after restart: web service still blocked from outside
+=== after restart: still locked, evidence kept, nothing broken
+PASS  audit rules locked
+PASS  same audit rules as before the attacks
+PASS  firewall on
+PASS  Sigma alerts kept
+PASS  log forwarding works
+PASS  no failed services, except scan findings
+PASS  admin can still log in (PAM)
+PASS  compliance report flags the threat alerts
+      report:   ✖ disk encryption: root filesystem is NOT encrypted
+      report:   ✖ Full-disk encryption (reinstall Ubuntu with full-disk encryption)
+      report:   ✖ Weekly vulnerability scan, nothing open (1 Ubuntu security notice(s) apply: USN-9166-1 -- Linux kernel vulnerabilities. Install updates; see vuln-report.html)
+      report:   ✖ No reachable network services (services reachable from the network: 22(sshd) 8080(python3))
+      report:   ✖ SSH hardened or off (SSH allows root or password logins)
+      report:   ✖ Threat detection: Sigma rules on audit events (65 threat alerts in the last 7 days; see /var/log/legion/sigma-alerts.log)
+      report:   ✖ Secure Boot (Secure Boot is off (turn it on in the firmware settings))
+      report:   ✖ No duplicate user or group IDs (duplicates: UID 0)
+      report:   ✖ System accounts cannot log in (system accounts with a login shell: legion-pt-root)
+      report:   ✖ Only root has UID 0 (an account other than root has full administrator rights (UID 0))
+      report:   ✖ No world-writable files
+      report:   ✖ Setuid programs all come from packages (1 setuid/setgid programs not from any package: /home/victim/legion-pt-suid)
+      report:   ✖ SOC 2: 33 pass, 11 fail
+      report:   ✖ HIPAA: 23 pass, 7 fail
+      report:   ✖ NIST 800-53 (FedRAMP): 34 pass, 11 fail
+      report:   ✖ NIST 800-171 (CMMC L2): 30 pass, 10 fail
+RESULT: 8 passed, 0 failed
+# Legion attack test
+
+Real Ubuntu 26.04 VM, Legion installed with the audit rules locked and logs forwarded to a log server.
+Each row is one attack. Blocked: Legion prevented it. Audit: the audit record that proves it, with the real user.
+Sigma: the alert it raised. Log server: a copy reached the log server, so wiping the device's logs does not erase it.
+
+| ID | Attack | ATT&CK | Blocked | Audit record | Sigma alert | Log server |
+|---|---|---|---|---|---|---|
+| A1 | Preload library planted (/etc/ld.so.preload) | T1574.006 | no (allowed) | persistence | Modification of ld.so.preload (high) | yes |
+| A2 | Second root account created (UID 0) | T1136.001 | no (allowed) | identity | Creation Of An User Account (medium) | yes |
+| A3 | Kernel module loaded with insmod | T1547.006 | no (allowed) | exec | Loading of Kernel Module via Insmod (high) | yes |
+| A4 | Blocked filesystem module requested | T1547.006 | yes | exec | none expected | yes |
+| A5 | Firewall turned off | T1562.004 | no (allowed) | firewall | Disable System Firewall (high) | yes |
+| A6 | sudo rule added for a backdoor account | T1548.003 | no (allowed) | privilege | none expected | yes |
+| A7 | Memory randomization (ASLR) turned off | T1562.001 | no (allowed) | exec | ASLR Disabled Via Sysctl or Direct Syscall - Linux (high) | yes |
+| A8 | System service created | T1543.002 | no (allowed) | legion-tamper | Systemd Service Creation (medium) | yes |
+| A9 | PAM module configuration added | T1556.003 | no (allowed) | identity | none expected | yes |
+| A10 | Logging configuration changed | T1562.006 | no (allowed) | persistence | Logging Configuration Changes on Linux Host (high) | yes |
+| V1 | Password hashes read (/etc/shadow) | T1003.008 | yes | access | none expected | yes |
+| V2 | sudo tried without permission | T1548.003 | yes | privilege | none expected | yes |
+| V3 | setuid copy of a shell made | T1548.001 | no (allowed) | perm_mod | Suspicious Commands Linux (medium) | yes |
+| V4 | cron job added | T1053.003 | no (allowed) | persistence | none expected | yes |
+| V5 | systemd user service added | T1543.002 | no (allowed) | persistence | none expected | yes |
+| V6 | desktop autostart entry added | T1547.013 | no (allowed) | persistence | none expected | yes |
+| V7 | SSH key planted (authorized_keys) | T1098.004 | no (allowed) | persistence | none expected | yes |
+| V8 | shell startup file changed (.bashrc) | T1546.004 | no (allowed) | persistence | none expected | yes |
+| V9 | tool downloaded to /tmp and run | T1204.002 | no (allowed) | exec | Program Executions in Suspicious Folders (medium) | yes |
+| V10 | file opened to everyone (chmod 777) | T1222.002 | no (allowed) | perm_mod | Suspicious Commands Linux (medium) | yes |
+| V11 | file sent out with wget --post-file | T1048.003 | no (allowed) | exec | **missing** | yes |
+| V12 | reverse shell over /dev/tcp | T1059.004 | no (allowed) | exec | none expected | yes |
+| V13 | another process's memory read (/proc/1/mem) | T1003.007 | yes | access | none expected | yes |
+| V14 | system discovery (whoami, uname, /etc/passwd) | T1082 | no (allowed) | exec | none expected | yes |
+| V15 | preload library planted without root | T1574.006 | yes | recorded | none expected | yes |
+| T1 | audit rules deletion tried | T1562.012 | yes | exec | none expected | yes |
+| T4 | auditd killed | T1562.012 | no (allowed) | recorded | none expected | yes |
+| T5 | Legion's detection program changed | T1562.001 | no (allowed) | legion-tamper | none expected | yes |
+| T6 | local audit log wiped | T1070.002 | no (allowed) | audit-log | none expected | yes |
+| E1 | port scan / reach an exposed service | T1046 | yes | firewall log | none expected | yes |
+| E2 | SSH password guessing | T1110.001 | yes | USER_AUTH failed | none expected | yes |
+| E3 | root login over SSH | T1078.003 | yes | sshd log only | none expected | yes |
+
+## Stability
+
+- 50,000 refused file opens in 1.8 s and 5,000 commands in 3.6 s; audit events lost: 0
+- Sigma check over that flood: 28.3 s, peak memory 729 MB
+
+Rows with a gap: 1
+PASS  every attack left an audit record and a copy on the log server
+RESULT: 1 passed, 0 failed
+ATTACK RESULT: 69 passed, 0 failed (report: attack-report.md)
+exit=0
