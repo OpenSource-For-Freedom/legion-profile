@@ -1,0 +1,11 @@
+969eef598402060a684eafd66deb5d7b5f1ae248
+ M legion.sh
+ M reports/sensor-comparison.md
+ M tests/collect-evidence.sh
+ M tests/vm/attack.sh
+ M tests/vm/vm-scenario.sh
+?? reports/README.md
+?? reports/attack-surface.md
+?? reports/container-suite.md
+?? reports/evidence/
+?? reports/vm-desktop.md

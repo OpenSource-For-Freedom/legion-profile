@@ -1,0 +1,145 @@
+shellcheck: clean
+DEPRECATED: The legacy builder is deprecated and will be removed in a future release.
+            Install the buildx component to build images with BuildKit:
+            https://docs.docker.com/go/buildx/
+
+=== refuses to run from a pipe
+PASS  piped run refused (exit 2)
+setup: hello unpacked but not configured: install ok unpacked
+=== install, no terminal, --no-ipv6, bad and broad networks in --allow-from
+PASS  legion exits 0 (got 0)
+PASS  waited for the package lists lock (patching passed)
+PASS  interrupted package install repaired
+PASS  Postfix without a configuration does not break hardening
+PASS  firewall on despite bad --allow-from entries
+PASS  only the private network was allowed
+PASS  no package removed during the run
+PASS  leftover package config not purged
+PASS  AIDE installed without its mail extras
+PASS  SSH allowed, rate-limited
+PASS  VM bridge allowed (input and routed)
+PASS  user firewall rule kept
+PASS  identical user rule not relabelled
+PASS  audit watches the real sudo and kmod
+PASS  cron.yearly locked
+PASS  IPv6 off keeps loopback
+PASS  integrity check clean right after install
+PASS  graphical login banner compiled into GDM's settings
+PASS  LEGION logo set for the login screen
+PASS  logo readable by the temporary login-screen user
+=== Phase 2: tamper lockdown
+PASS  log server receives system logs
+PASS  forwarding has a disk queue for offline times
+PASS  bad log server address refused, nothing changed
+PASS  audit lock rule written, and no other file sets the lock
+PASS  Legion's own files and AI agent settings are watched
+PASS  sandboxed daily check still runs
+PASS  sandboxed services are sandboxed
+PASS  evidence bundle has the baseline checksums
+=== Phase 3: threat detection (Sigma rules, paired with YARA)
+PASS  Zircolite installed from the pinned, checksummed release
+PASS  only audit-log Sigma rules, medium level and up
+PASS  Sigma check runs every 15 minutes
+PASS  every command people run is audited
+PASS  ld.so.preload watched before it exists
+      2026-11-26T04:41:44Z high: Modification of ld.so.preload | ubuntu | /etc/ld.so.preload | no file to scan
+      2026-11-26T04:41:43Z medium: Suspicious Commands Linux | ubuntu | chmod 777 /tmp/f | YARA: no match
+      2026-11-26T04:41:42Z medium: Program Executions in Suspicious Folders | ubuntu | /tmp/evil-test | YARA: no match
+PASS  Sigma check raises alerts for the attack (exit 1)
+PASS  alert: Program Executions in Suspicious Folders
+PASS  alert: Suspicious Commands Linux
+PASS  alert: Modification of ld.so.preload
+PASS  alert names the user, program and command
+PASS  program from the alert scanned with YARA
+            2 "yara": "YARA: no match"
+            1 "yara": "no file to scan"
+PASS  package manager changes not reported
+PASS  alerts in the system log (and so on the log server)
+PASS  alerts reach the log server
+PASS  events already checked are not reported again (sandboxed service)
+PASS  rules listed in /etc/legion/sigma-ignore stay quiet
+PASS  compliance report flags the alerts
+PASS  evidence bundle carries the alerts
+=== Phase 1: CIS / 800-171 additions
+PASS  kit's password age: 90 days max, 1 min, 7 warn, 45 inactive
+PASS  old password given 14 days, not expired on the spot
+PASS  new accounts: 90-day passwords, disabled after 45 days
+PASS  kit can still log in (password not expired)
+PASS  idle shell timeout for console and SSH, not graphical terminals
+PASS  login umask hides new files from other users
+PASS  sudo still works, and keeps umask 022 for root
+PASS  sudo settings in place and valid
+PASS  su refused for normal users
+PASS  root can still su
+PASS  core dumps off, apport off
+PASS  unused filesystems blocked
+PASS  SSH hardened and still running
+PASS  login screen hides user names
+PASS  media autorun off and locked
+PASS  CIS audit rules generated (privileged programs, access, delete)
+PASS  audit rules only use system calls the machine has
+PASS  auditd alerts when its disk runs low
+vulnerability scan: 2026-11-26T04:41:12Z 1 exit-code
+PASS  vulnerability scan ran and wrote its report
+PASS  report lists the new checks
+      report:   ✖ disk encryption: root filesystem is NOT encrypted
+      report:   ✖ Full-disk encryption (reinstall Ubuntu with full-disk encryption)
+      report:   ✖ Weekly vulnerability scan, nothing open (1 Ubuntu security notice(s) apply: USN-9166-1 -- Linux kernel vulnerabilities. Install updates; see vuln-report.html)
+      report:   ✖ No reachable network services (services reachable from the network: 22(sshd))
+      report:   ✖ SSH hardened or off (SSH allows root or password logins)
+      report:   ✖ SOC 2: 36 pass, 4 fail
+      report:   ✖ HIPAA: 24 pass, 3 fail
+      report:   ✖ NIST 800-53 (FedRAMP): 37 pass, 4 fail
+      report:   ✖ NIST 800-171 (CMMC L2): 34 pass, 4 fail
+PASS  no failed units
+PASS  root shell history does not trip the integrity check
+PASS  editing /root/.bashrc trips the integrity check
+PASS  a failed scan fails its compliance check
+=== integrity: package updates accepted, other changes kept for review
+PASS  apt run kept the earlier, unrelated change for review
+PASS  files apt itself changed were not flagged
+PASS  daily check fails while the change is unreviewed
+PASS  accepting with 'manual' clears it
+=== password history
+PASS  password change works
+PASS  reusing a recent password is refused
+PASS  lockout: correct password works
+PASS  lockout: 5 failures lock the account
+PASS  lockout: admin reset unlocks
+PASS  drift check quiet when nothing changed
+=== one run at a time
+PASS  second run at the same time refused (exit 2)
+=== NO_COLOR survives the sudo hand-off
+PASS  no color codes after sudo
+=== drift alerts persist until fixed
+PASS  drift alert on firewall off (1), still after a manual check (1), cleared when fixed (0)
+=== stale package lists
+PASS  updates check fails on 5-day-old package lists
+=== second run (repeatable)
+PASS  second run exits 0 (got 0)
+PASS  no duplicate firewall rules
+=== remove
+PASS  remove exits 0 (got 0)
+PASS  firewall still on, as before Legion
+PASS  firewall rules exactly as before
+PASS  PAM files and banners byte-identical to before
+PASS  lockout gone
+PASS  kit's password age back to before (except the change date)
+PASS  sudo, SSH, session, core dump, filesystem files removed
+PASS  group legion-su deleted, su works as before
+PASS  vulnerability scan removed
+PASS  SSH server still running after removal
+PASS  threat detection removed
+PASS  audit lock and log forwarding removed
+PASS  IPv6 file removed
+PASS  logo image removed
+PASS  cron.yearly back to 755
+PASS  no failed units after removal
+PASS  second removal is clean
+=== removal when the login files were edited after Legion
+PASS  removal reports the lockout still active (exit 1)
+PASS  Legion's PAM profiles kept so it can be finished
+PASS  removal finishes after the forced update (exit 0)
+PASS  lockout really gone
+RESULT: 108 passed, 0 failed
+exit=0

@@ -14,13 +14,20 @@ CIS and DISA STIG have not published benchmarks for Ubuntu 26.04 yet. Until they
 - Updates: installs all pending updates and turns on daily automatic security updates
 - Firewall: blocks incoming connections, allows outgoing
 - Account lockout: 5 failed logins lock an account for 30 minutes, then it unlocks by itself
-- Login banner, and a screen lock after 10 minutes that users cannot turn off
-- Password policy: new passwords need 12+ characters and 3 character types
-- Audit logging: records changes to accounts, sudo, system time, kernel modules and the firewall
+- Login banner, and a screen lock after 10 minutes that users cannot turn off. The login screen asks for the user name instead of listing users
+- Passwords: 12+ characters and 3 character types, the last 24 cannot be reused, and they expire every 90 days. An account is disabled 45 days after its password expires
+- Sessions: idle console and SSH sessions end after 15 minutes, new files are private to their owner (umask 027), sudo asks for the password again after 15 minutes, and only root can use su
+- Audit logging: the CIS set of audit rules. Changes to accounts, sudo and settings, logins, refused file access, permission changes, deletions, mounts, kernel modules and every use of a privileged program, plus every command people run and changes to the files attackers use to start code at login. You get an alert when the audit log disk runs low
+- Threat detection: every 15 minutes the new audit events are checked against the Sigma rules for Linux audit logs (SigmaHQ, run with Zircolite). Each alert names the user, the program and the command, and the program or file involved is scanned with YARA right away. Alerts go to the system log (and so to your log server) and to `/var/log/legion/sigma-alerts.log`
 - Log retention: keeps system logs for 1 year
+- Log forwarding (optional): sends a copy of system and audit logs to your log server over syslog, with TLS if you want it. Logs wait on disk while the server is unreachable
+- Audit lock (optional): the audit rules cannot be changed or turned off, even by root, until the next restart
+- Tamper alerts: changes to Legion's own scripts, settings and baseline, and to AI coding agent settings, are recorded in the audit log. Legion's scan services run in a sandbox
 - Malware scanning: ClamAV weekly, plus YARA weekly with the YARA Forge core rules
+- Vulnerability scanning: weekly, with Ubuntu's own security notices (OVAL) and OpenSCAP
 - File integrity: daily check of installed package files and of /etc, /boot, /usr/local and /root
-- System hardening: safer kernel settings, unused network protocols blocked, tighter cron and sudoers permissions
+- System hardening: safer kernel settings, unused network protocols and filesystems blocked, no core dumps, USB drives and discs never start programs, SSH server hardened (if installed), tighter cron, sudoers and account file permissions
+- File and account review (report only): world-writable files, files without an owner, setuid programs that no package installed, duplicate IDs, open home folders, system accounts with a login shell
 - Daily compliance check: flags any check that starts failing
 
 ## Before you run it
@@ -35,7 +42,15 @@ cd legion-profile
 bash legion.sh
 ```
 
-It asks for your sudo password, then a few questions so the firewall does not cut you off: whether to keep SSH or Remote Desktop reachable (if they are running), whether you use Tailscale, which private networks need to reach this device, and whether you need IPv6. It also asks for your Ubuntu Pro token (press Enter to skip). Then it runs each step and shows the result. Reboot when it finishes.
+It asks for your sudo password, then a few questions so the firewall does not cut you off: whether to keep SSH or Remote Desktop reachable (if they are running), whether you use Tailscale, which private networks need to reach this device, and whether you need IPv6. It also asks for your Ubuntu Pro token (press Enter to skip), whether to send logs to a log server, and whether to lock the audit rules. Then it runs each step and shows the result. Reboot when it finishes.
+
+The log server address looks like `syslog://logs.example.com:514`, or `syslog+tls://logs.example.com:6514` for TLS (checked against the system's trusted certificates). The same answers can be given as options, so the questions are skipped:
+
+```bash
+bash legion.sh --forward-logs syslog+tls://logs.example.com:6514 --lock-audit
+```
+
+`--no-forward-logs` and `--no-lock-audit` turn them off again. When the audit rules are locked, changes to them take effect after the next restart.
 
 To skip the token question:
 
@@ -55,11 +70,13 @@ Run `bash legion.sh --help` for all options. It is safe to run again.
 
 - Compliance report: `/var/log/legion/compliance-report.md` (and `.json`)
 - Evidence bundles: `/var/log/legion/evidence/`, each with a SHA-256 checksum
-- Scan results: `/var/log/legion/yara-scan.log` and `integrity.log`
+- Scan results: `/var/log/legion/yara-scan.log`, `integrity.log` and `sigma-alerts.log`
 
-A ClamAV, YARA, integrity or daily compliance finding marks its service as failed. Check with `systemctl --failed`.
+A ClamAV, YARA, Sigma, integrity or daily compliance finding marks its service as failed. Check with `systemctl --failed`.
 
 Package updates are accepted into the integrity baseline automatically. Any other change to watched files stays reported in `/var/log/legion/integrity.log` until you review it and accept it with `sudo legion-aide-baseline manual`.
+
+If a Sigma rule keeps flagging something that is normal on your device, add the rule's title (as shown in `sigma-alerts.log`) to `/etc/legion/sigma-ignore`. Changes made by package installs and by Legion's own runs are not reported.
 
 ## If you get locked out
 
@@ -73,7 +90,15 @@ Every change is tested in an Ubuntu 26.04 container with systemd:
 bash tests/run.sh
 ```
 
-It installs Legion, checks the firewall, lockout, integrity and scan results, runs Legion again, removes it and confirms the system is back to how it was. Containers cannot load audit rules or kernel settings, so those need a real machine or VM.
+It installs Legion, checks the firewall, lockout, passwords, sessions, integrity and scan results, runs Legion again, removes it and confirms the system is back to how it was.
+
+Containers cannot load audit rules or kernel settings, so a second test runs Legion in a real Ubuntu 26.04 virtual machine (QEMU, inside Docker) with the GNOME desktop. It installs Legion with the audit lock and log forwarding, restarts several times, and after each restart logs in at the login screen (typed like a person would), on the text console and with sudo. Then it runs Legion again, removes it, restarts and checks that logins still work. Screenshots of the login screen and the desktop are saved:
+
+```bash
+bash tests/vm/run.sh
+```
+
+It needs Docker and hardware virtualization (/dev/kvm), and downloads the Ubuntu cloud image once. It takes about 30 minutes.
 
 ## How to remove it
 
@@ -90,4 +115,12 @@ It keeps installed updates, Ubuntu Pro and your logs. Add `--remove-packages`, `
 - No script makes an organization compliant. These frameworks also cover policies, training, backups and vendor agreements. The report lists what Legion cannot check.
 - FIPS-validated cryptography, required for FedRAMP and CMMC, is not yet available for Ubuntu 26.04. Legion reports it and picks it up once Ubuntu Pro offers it.
 - Docker bypasses the firewall for published container ports.
+- Passwords expire every 90 days. On the first run, a password that is already older than 76 days gets 14 more days, so nobody is forced to change it in the middle of a session.
+- Files you create are no longer readable by other users. Commands run with sudo keep Ubuntu's usual permissions, so software installed with sudo still works for everyone.
+- Some filesystems are blocked: hfs and hfsplus (Mac drives), udf (DVDs and some USB drives), cramfs, freevxfs and jffs2. USB drives formatted as FAT, exFAT or NTFS work as usual.
+- Log forwarding sends standard syslog over TCP or TLS, which most log servers and SIEMs accept. Services that only take HTTP uploads or a cloud resource ID need their vendor's own agent.
+- Recording every command makes the audit log grow faster on a busy desktop. Legion keeps 20 audit files of 32 MB and rotates the oldest out; with log forwarding, the log server keeps the full history.
+- Threat detection uses a pinned Zircolite release, checked against its published SHA-256 before it is installed. `--no-sigma` skips it.
+- If the audit rules are locked, removing Legion leaves them active until the next restart.
+- sudo-rs, Ubuntu 26.04's sudo, has no separate log file. sudo use is recorded in the system journal and by the audit rules.
 - Earlier versions of Legion installed the Postfix mail server as a side effect of installing AIDE. Legion now sets Postfix to accept connections from this device only. If nothing on your machine sends mail, you can remove it: `sudo apt purge postfix bsd-mailx`.

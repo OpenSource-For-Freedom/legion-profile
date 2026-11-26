@@ -112,6 +112,41 @@ if [ -f /usr/share/pam-configs/legion-faillock ] || [ -f /usr/share/pam-configs/
         sed -i -E "/^legion-faillock(-notify)?$/d" /var/lib/pam/seen'
   fi
 fi
+if [ -f /usr/share/pam-configs/legion-pwhistory ]; then
+  pam-auth-update --disable legion-pwhistory >/dev/null 2>&1 || true
+  if grep -qE '^[^#]*pam_pwhistory.so remember=24' /etc/pam.d/common-password; then
+    fail "password history still active: /etc/pam.d/common-password has local edits"
+    info "to finish, run: sudo pam-auth-update --force --disable legion-pwhistory, then this script again"
+    FAILED=$((FAILED + 1))
+  else
+    undo "password history removed" bash -c '
+      rm -f /usr/share/pam-configs/legion-pwhistory && sed -i -E "/^legion-pwhistory$/d" /var/lib/pam/seen'
+  fi
+fi
+# The old password hashes it kept are deleted with it, if Legion created the file.
+[ ! -f "$B/created-opasswd" ] || [ -f /usr/share/pam-configs/legion-pwhistory ] || undo "saved old passwords deleted" rm -f /etc/security/opasswd
+if [ -f "$B/chage" ]; then
+  # Each account's password age settings as they were; the date of the last
+  # password change is left alone, since the user may have changed it since.
+  # shellcheck disable=SC2016 # expanded by the inner shell
+  undo "password age settings of each account restored" bash -c '
+    while IFS=: read -r u _ min max warn inact; do
+      id "$u" >/dev/null 2>&1 || continue
+      chage -m "${min:--1}" -M "${max:--1}" -W "${warn:--1}" -I "${inact:--1}" "$u"
+    done <"$1"' _ "$B/chage"
+fi
+for f in login.defs:/etc/login.defs useradd:/etc/default/useradd pam.d-su:/etc/pam.d/su apport:/etc/default/apport; do
+  if [ -f "$B/${f%%:*}" ]; then undo "${f#*:} restored" cp -p "$B/${f%%:*}" "${f#*:}"; fi
+done
+if [ -f "$B/created-group-legion-su" ] && getent group legion-su >/dev/null; then undo "group legion-su deleted" groupdel legion-su; fi
+if [ -f /etc/sudoers.d/legion ]; then undo "sudo settings removed" rm -f /etc/sudoers.d/legion; fi
+undo "idle session timeout and core dump settings removed" rm -f /etc/profile.d/legion-session.sh /etc/security/limits.d/legion.conf /etc/systemd/coredump.conf.d/legion.conf
+if [ -f "$B/apport-state" ] && [ "$(cat "$B/apport-state")" = enabled ]; then
+  undo "crash reporter (apport) turned back on" systemctl enable --now apport.service
+fi
+if [ -f /etc/ssh/sshd_config.d/00-legion.conf ]; then
+  undo "SSH server settings removed" bash -c 'rm -f /etc/ssh/sshd_config.d/00-legion.conf && { systemctl try-reload-or-restart ssh.service 2>/dev/null || true; }'
+fi
 if [ -e "$B/issue" ] || [ -e "$B/issue.absent" ] || [ -e "$B/issue.net" ] || [ -e "$B/issue.net.absent" ]; then
   # shellcheck disable=SC2016 # expanded by the inner shell
   undo "login banner restored" bash -c '
@@ -119,12 +154,13 @@ if [ -e "$B/issue" ] || [ -e "$B/issue.absent" ] || [ -e "$B/issue.net" ] || [ -
       if [ -f "$1/$f" ]; then cp -p "$1/$f" "/etc/$f"; elif [ -f "$1/$f.absent" ]; then rm -f "/etc/$f"; fi
     done' _ "$B"
 fi
-if [ -f /etc/dconf/db/gdm.d/01-legion-banner ] || [ -f /etc/dconf/db/local.d/00-legion-screenlock ]; then
+if [ -f /etc/dconf/db/gdm.d/01-legion-banner ] || [ -f /etc/dconf/db/local.d/00-legion-screenlock ] || [ -f /etc/dconf/db/local.d/00-legion-media ]; then
   # Empty settings folders are left in place on purpose: dconf update then
   # rebuilds them as empty databases, so no Legion lock survives.
   # shellcheck disable=SC2016 # expanded by the inner shell
-  undo "login screen banner and enforced screen lock removed" bash -c '
-    rm -f /etc/dconf/db/gdm.d/01-legion-banner /etc/dconf/db/local.d/00-legion-screenlock /etc/dconf/db/local.d/locks/00-legion-screenlock
+  undo "login screen banner, enforced screen lock and media autorun setting removed" bash -c '
+    rm -f /etc/dconf/db/gdm.d/01-legion-banner /etc/dconf/db/local.d/00-legion-screenlock /etc/dconf/db/local.d/locks/00-legion-screenlock \
+      /etc/dconf/db/local.d/00-legion-media /etc/dconf/db/local.d/locks/00-legion-media
     [ ! -f "$1/created-dconf-profile-gdm" ] || rm -f /etc/dconf/profile/gdm
     [ ! -f "$1/created-dconf-profile-user" ] || rm -f /etc/dconf/profile/user
     dconf update' _ "$B"
@@ -140,6 +176,13 @@ fi
 
 section "Scheduled scans and checks"
 undo "YARA weekly scan removed" bash -c "$(declare -f unit_off); unit_off legion-yara-scan.timer legion-yara-scan.service; rm -f /usr/local/sbin/legion-yara-update /usr/local/sbin/legion-yara-scan"
+if [ -s /var/lib/legion/created-dirs ]; then
+  # Empty folders Legion created in home folders so they could be watched;
+  # anything put in them since is kept.
+  # shellcheck disable=SC2016 # expanded by the inner shell
+  undo "empty watched folders in home folders removed" bash -c 'tac /var/lib/legion/created-dirs | while read -r d; do rmdir "$d" 2>/dev/null || true; done; rm -f /var/lib/legion/created-dirs'
+fi
+undo "threat detection removed (Sigma rules and Zircolite)" bash -c "$(declare -f unit_off); unit_off legion-sigma-scan.timer legion-sigma-scan.service; rm -f /usr/local/sbin/legion-sigma-scan /usr/local/lib/legion/sigma-alerts.py /etc/legion/sigma-ignore; rm -rf /opt/legion/zircolite /opt/legion/zircolite.new /var/lib/legion/sigma; rmdir /usr/local/lib/legion /opt/legion 2>/dev/null || true"
 undo "integrity check removed (AIDE and package checks)" bash -c "$(declare -f unit_off); unit_off legion-integrity.timer legion-integrity.service; rm -f /usr/local/sbin/legion-aide-baseline /usr/local/sbin/legion-integrity-check /etc/apt/apt.conf.d/99legion-aide; rm -rf /etc/legion"
 # Ubuntu's own AIDE timer goes back to how it was before Legion. Older Legion
 # versions did not record that; then it is turned on only if Ubuntu's AIDE
@@ -154,6 +197,7 @@ undo "Ubuntu's own daily AIDE timer restored" bash -c '
   elif [ -f /var/lib/aide/aide.db ]; then
     systemctl enable --now dailyaidecheck.timer
   fi' _ "$B" "$REMOVE_PACKAGES"
+undo "weekly vulnerability scan removed" bash -c "$(declare -f unit_off); unit_off legion-vuln-scan.timer legion-vuln-scan.service; rm -f /usr/local/sbin/legion-vuln-scan"
 undo "ClamAV weekly scan removed" bash -c "$(declare -f unit_off); unit_off clamscan-home.timer clamscan-home.service"
 undo "daily compliance check, the legion command and its images removed" bash -c "$(declare -f unit_off); unit_off legion-check.timer legion-check.service; rm -f /usr/local/sbin/legion; rm -rf /usr/local/share/legion"
 undo "Legion state removed (/var/lib/legion)" rm -rf /var/lib/legion
@@ -192,13 +236,23 @@ if [ -e "$B/20auto-upgrades" ]; then
 elif [ -e "$B/20auto-upgrades.absent" ]; then
   undo "automatic update settings restored" rm -f /etc/apt/apt.conf.d/20auto-upgrades
 fi
-undo "audit rules removed" rm -f /etc/audit/rules.d/legion.rules /etc/audit/rules.d/soc2.rules
+AUDIT_LOCKED=0
+! in_container && auditctl -s 2>/dev/null | grep -qx 'enabled 2' && AUDIT_LOCKED=1
+if [ -f /etc/systemd/system/auditd.service.d/legion.conf ]; then
+  undo "auditd can be stopped by hand again (Ubuntu default)" bash -c 'rm -f /etc/systemd/system/auditd.service.d/legion.conf; rmdir /etc/systemd/system/auditd.service.d 2>/dev/null; systemctl daemon-reload'
+fi
+undo "audit rules removed" rm -f /etc/audit/rules.d/legion.rules /etc/audit/rules.d/soc2.rules /etc/audit/rules.d/99-legion-lock.rules /usr/local/sbin/legion-audit-alert
+if [ -f /etc/rsyslog.d/60-legion-forward.conf ]; then
+  undo "log forwarding to the log server stopped" bash -c 'rm -f /etc/rsyslog.d/60-legion-forward.conf && systemctl try-restart rsyslog'
+fi
 if [ -f "$B/auditd.conf" ]; then
   undo "audit settings restored" cp -p "$B/auditd.conf" /etc/audit/auditd.conf
 elif [ -f /etc/audit/auditd.conf ]; then
   undo "audit log rotation back to Ubuntu default (5 files)" sed -i -E 's/^num_logs\s*=.*/num_logs = 5/' /etc/audit/auditd.conf
 fi
-if command -v augenrules >/dev/null && ! in_container; then
+if [ "$AUDIT_LOCKED" = 1 ]; then
+  warn "the audit rules are locked until a restart; Legion's rules stop after you reboot"
+elif command -v augenrules >/dev/null && ! in_container; then
   undo "audit rules reloaded" augenrules --load
 fi
 undo "log retention back to Ubuntu default" bash -c 'rm -f /etc/systemd/journald.conf.d/legion.conf /etc/systemd/journald.conf.d/soc2.conf; systemctl restart systemd-journald'
@@ -226,7 +280,7 @@ if ! in_container; then
         { systemctl try-restart apport.service 2>/dev/null || true; }'
   fi
 fi
-undo "network protocol blocks removed" rm -f /etc/modprobe.d/legion-uncommon-net.conf /etc/modprobe.d/soc2-uncommon-net.conf
+undo "network protocol and filesystem blocks removed" rm -f /etc/modprobe.d/legion-uncommon-net.conf /etc/modprobe.d/soc2-uncommon-net.conf /etc/modprobe.d/legion-filesystems.conf
 # shellcheck disable=SC2016 # expanded by the inner shell
 undo "cron and sudoers permissions back to Ubuntu defaults" bash -c '
   [ ! -f /etc/crontab ] || chmod 644 /etc/crontab
@@ -285,6 +339,7 @@ section "Result"
 if [ "$FAILED" = 0 ]; then
   ok "Legion Profile removed"
   info "reboot to make sure every kernel setting is back to normal"
+  [ "$AUDIT_LOCKED" = 0 ] || warn "reboot needed: the locked audit rules stay active until then"
 else
   fail "$FAILED step(s) could not be undone; see the lines marked above"
   exit 1
